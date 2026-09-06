@@ -172,7 +172,7 @@ public struct FounderHQEventsConfiguration: Sendable {
     public var eventTTL: TimeInterval
 
     public init(
-        host: URL = URL(string: "https://app.getfounderhq.com")!,
+        host: URL = URL(string: "https://i.getfounderhq.com")!,
         flushAt: Int = 20,
         flushInterval: TimeInterval = 5,
         personProfiles: FounderHQPersonProfiles = .identifiedOnly,
@@ -206,7 +206,7 @@ public struct FounderHQEventsConfiguration: Sendable {
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "0.7.0"
+    public static let sdkVersion = "0.8.0"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration

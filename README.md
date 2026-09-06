@@ -6,18 +6,18 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 
 `https://github.com/FounderHQ/founderhq-events-ios`
 
-Select version **0.7.0** or later. Swift Package Manager is the recommended installation method.
+Select version **0.8.0** or later. Swift Package Manager is the recommended installation method.
 
 For CocoaPods:
 
 ```ruby
-pod 'FounderHQEvents', '~> 0.7.0'
+pod 'FounderHQEvents', '~> 0.8.0'
 ```
 
 For installation directly from the release tag:
 
 ```ruby
-pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v0.7.0'
+pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v0.8.0'
 ```
 
 Both installation methods use the same Swift implementation. Requires iOS 15 or later.
@@ -29,7 +29,7 @@ application lifecycle and UIKit screen capture, a SwiftUI `founderHQScreen`
 modifier, durable identity/queue/consent, and the same capture/profile API as
 the web SDK. Advertising identifiers are never collected.
 
-Version 0.7.0 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
+Version 0.8.0 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 and reports screen/viewport dimensions in physical pixels. Automatic facts use
 the canonical `$` taxonomy and deep links recognize all 24 campaign keys.
@@ -57,3 +57,9 @@ The package includes the required-reason declaration for its app-local
 UserDefaults storage. Your app's privacy disclosures must also cover the event
 properties and identity information it sends. If you inject shared App Group
 storage, include the corresponding App Group access reason in your app's manifest.
+
+## Release notes
+
+### 0.8.0
+
+- The default host is now `https://i.getfounderhq.com`. `app.getfounderhq.com` no longer serves SDK ingest.
