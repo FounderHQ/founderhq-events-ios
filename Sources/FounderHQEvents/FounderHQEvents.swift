@@ -170,11 +170,72 @@ public struct FounderHQEventsConfiguration: Sendable {
     public var purchasePrepareTimeout: TimeInterval
     public var maxQueueSize: Int
     public var eventTTL: TimeInterval
+    /**
+     How many delivery attempts a queued event gets after its first one fails,
+     and so how far it climbs the retry ladder.
 
+     The ladder is: send at once, then wait 30 seconds, 30 seconds, 2 minutes,
+     5 minutes, and finally try once more the next time the SDK starts in a
+     new process. The first two rungs recover the common failure, which is a
+     phone in a lift, in a tunnel, or on a train. The longer rungs cost the
+     customer almost nothing, because an offline app has nothing else to do.
+     The last rung waits for a launch instead of a clock, so an event whose
+     app was killed during an outage still gets one more chance. An event the
+     ingest API will never accept still dies, because the ladder ends.
+
+     `eventTTL` outranks the ladder: an event older than 24 hours is dropped
+     even with rungs left, so the queue can never hold stale data.
+
+     The default, 5, is the whole ladder. A smaller number keeps the first
+     rungs and drops the rest, so `maxRetries: 2` waits 30 seconds, waits 30
+     seconds again, and then gives up. `0` sends once and never retries.
+
+     With `debug` on, the SDK says how many events it dropped and why.
+     */
+    public var maxRetries: Int
+    /**
+     Captures `$autocapture` for button and control taps, and `$rageclick`
+     when the same control is tapped three times inside one second. Off by
+     default: a tap stream is the most surprising thing an analytics SDK can
+     turn on for you, so the app has to ask for it.
+
+     The SDK stores the element's type, its accessibility identifier and
+     label, the title a button, bar button, or segmented control renders, and
+     the view hierarchy path. It never stores what a person typed: text
+     fields, text views, and search bars are skipped whole. It never stores
+     tap coordinates.
+
+     This flag is the default, not the ceiling. Remote config wins in both
+     directions once it arrives: `autocapture` can switch element capture off
+     for every install at once, and on for an app that shipped with it
+     `false`. `capture_rageclicks` gates rage clicks on top of that.
+     */
+    public var captureElementInteractions: Bool
+    /**
+     Exact hostnames — no protocol, path, port, or wildcard — whose requests
+     carry the current session id in the `x-founderhq-session-id` header, so
+     backend events join the visit that caused them. Only the session id
+     travels: a distinct id in a header is forgeable and the ingest API
+     ignores it. Requests to any other host are left alone, because a session
+     id must never reach a third party.
+     */
+    public var tracingHeaders: [String]?
+    /**
+     Emits `$push_notification_opened` when the user taps a notification. On
+     by default because the tap is the moment the app comes back, and the SDK
+     only reads the action, category, and request identifiers — never the
+     title, body, payload, or anything the user typed in reply.
+     */
+    public var capturePushNotificationOpened: Bool
+    /**
+     Prints what the SDK drops, refuses, or fails to install. Off by default
+     so a shipping app stays quiet; turn it on while you wire the SDK up.
+     */
+    public var debug: Bool
     public init(
         host: URL = URL(string: "https://i.getfounderhq.com")!,
         flushAt: Int = 20,
-        flushInterval: TimeInterval = 5,
+        flushInterval: TimeInterval = 10,
         personProfiles: FounderHQPersonProfiles = .identifiedOnly,
         optOutByDefault: Bool = false,
         captureLifecycle: Bool = true,
@@ -184,8 +245,13 @@ public struct FounderHQEventsConfiguration: Sendable {
         remoteConfig: Bool = true,
         account: FounderHQAccountContext? = nil,
         purchasePrepareTimeout: TimeInterval = 3,
-        maxQueueSize: Int = 100,
-        eventTTL: TimeInterval = 24 * 60 * 60
+        maxQueueSize: Int = 1_000,
+        eventTTL: TimeInterval = 24 * 60 * 60,
+        maxRetries: Int = 5,
+        captureElementInteractions: Bool = false,
+        tracingHeaders: [String]? = nil,
+        capturePushNotificationOpened: Bool = true,
+        debug: Bool = false
     ) {
         self.host = host
         self.flushAt = flushAt
@@ -201,12 +267,17 @@ public struct FounderHQEventsConfiguration: Sendable {
         self.purchasePrepareTimeout = purchasePrepareTimeout
         self.maxQueueSize = maxQueueSize
         self.eventTTL = eventTTL
+        self.maxRetries = maxRetries
+        self.captureElementInteractions = captureElementInteractions
+        self.tracingHeaders = tracingHeaders
+        self.capturePushNotificationOpened = capturePushNotificationOpened
+        self.debug = debug
     }
 }
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "0.8.0"
+    public static let sdkVersion = "1.0.0"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration
@@ -222,6 +293,11 @@ public final class FounderHQEvents: @unchecked Sendable {
     private let invocationLock = NSLock()
     private var invocationTail: Task<Void, Never>?
     private var screenCaptureInstalled = false
+    private var elementCaptureInstalled = false
+    private var pushCaptureInstalled = false
+    private var tracingHeadersInstalled = false
+    private let sessionSnapshot = FounderHQSessionSnapshot()
+    private let interactionSnapshot = FounderHQInteractionCaptureSnapshot()
 
     public init(
         apiKey: String,
@@ -243,7 +319,12 @@ public final class FounderHQEvents: @unchecked Sendable {
         self.capturePolicy = AutomaticCapturePolicy(
             lifecycle: configuration.captureLifecycle,
             screens: configuration.captureScreens,
-            sessions: configuration.captureSessions
+            sessions: configuration.captureSessions,
+            elements: configuration.captureElementInteractions
+        )
+        interactionSnapshot.set(
+            elements: configuration.captureElementInteractions,
+            rageClicks: configuration.captureElementInteractions
         )
         self.state = EventsState(
             key: stateStorageKey,
@@ -253,7 +334,10 @@ public final class FounderHQEvents: @unchecked Sendable {
             clock: dependencies.clock,
             uuid: dependencies.uuid,
             maxQueueSize: configuration.maxQueueSize,
-            eventTTL: configuration.eventTTL
+            eventTTL: configuration.eventTTL,
+            maxRetries: configuration.maxRetries,
+            retryLadder: founderHQRetryLadder,
+            debug: configuration.debug
         )
         startTimer()
         initialization = Task { [weak self] in
@@ -273,6 +357,7 @@ public final class FounderHQEvents: @unchecked Sendable {
                 _ = await fetchRemoteConfig()
             }
             await armAutomaticCapture()
+            await refreshSessionSnapshot()
             if state.needsSessionStart,
                await capturePolicy.sessions,
                !(await state.isOptedOut) {
@@ -525,6 +610,7 @@ public final class FounderHQEvents: @unchecked Sendable {
     private func resetOperation() async {
         await initialization?.value
         let transition = await state.reset()
+        await refreshSessionSnapshot()
         if transition.enabled {
             await revenueCatIdentity?.logIn(appUserID: transition.token)
             await captureCore("$set", properties: [
@@ -547,6 +633,7 @@ public final class FounderHQEvents: @unchecked Sendable {
     private func setOptedOutOperation(_ optedOut: Bool) async {
         await initialization?.value
         await state.setOptedOut(optedOut)
+        await refreshSessionSnapshot()
     }
     public func isOptedOut() async -> Bool { await state.isOptedOut }
     public func getDistinctId() async -> String { await state.distinctId }
@@ -556,6 +643,7 @@ public final class FounderHQEvents: @unchecked Sendable {
         if result.rotated, await capturePolicy.sessions {
             await captureCore("$session_start", properties: [:])
         }
+        await refreshSessionSnapshot()
         return result.identity.sessionId
     }
 
@@ -637,7 +725,7 @@ public final class FounderHQEvents: @unchecked Sendable {
                 ))
                 once.resume(.completed(.init(
                     prepared: prepared,
-                    acknowledged: await self.flushCore()
+                    acknowledged: await self.flushCore(respectRetryLadder: false)
                 )))
             }
             DispatchQueue.global().asyncAfter(
@@ -914,14 +1002,35 @@ public final class FounderHQEvents: @unchecked Sendable {
         return await fetchRemoteConfig()
     }
 
+    /**
+     Applies one operator config payload.
+
+     The operator's settings win, in both directions, exactly as they do for
+     `capture_screens` and `capture_lifecycle`. `captureElementInteractions`
+     is the default that holds until the settings arrive, not a ceiling. A
+     shipped app cannot be rebuilt on demand, so an operator must be able to
+     switch a tap stream both off for every install at once and on for an app
+     that shipped with the wrong default.
+
+     `autocapture` may also arrive as a rules object rather than a boolean.
+     Only a boolean changes anything here; a rules object leaves capture as
+     the app set it, because iOS does not evaluate the web selector rules.
+     */
     private func applyRemoteConfigCore(_ config: [String: Any]) async {
         let previousLifecycle = await capturePolicy.lifecycle
         let previousScreens = await capturePolicy.screens
+        let previousElements = await capturePolicy.elements
+        let elements = config["autocapture"] as? Bool
+            ?? configuration.captureElementInteractions
+        let rageClicks = (config["capture_rageclicks"] as? Bool ?? true) && elements
         await capturePolicy.apply(
             lifecycle: config["capture_lifecycle"] as? Bool ?? configuration.captureLifecycle,
             screens: config["capture_screens"] as? Bool ?? configuration.captureScreens,
-            sessions: config["capture_sessions"] as? Bool ?? configuration.captureSessions
+            sessions: config["capture_sessions"] as? Bool ?? configuration.captureSessions,
+            elements: elements,
+            rageClicks: rageClicks
         )
+        interactionSnapshot.set(elements: elements, rageClicks: rageClicks)
         let lifecycle = await capturePolicy.lifecycle
         if previousLifecycle && !lifecycle {
             observers.forEach(NotificationCenter.default.removeObserver)
@@ -933,9 +1042,14 @@ public final class FounderHQEvents: @unchecked Sendable {
         if !previousScreens && screens {
             await installScreenCaptureIfNeeded()
         }
+        if !previousElements && elements {
+            await installInteractionCaptureIfNeeded()
+        }
         var disabled = Set<String>()
         if !(await capturePolicy.sessions) { disabled.insert("$session_start") }
         if !(await capturePolicy.screens) { disabled.insert("$screen") }
+        if !elements { disabled.insert("$autocapture") }
+        if !rageClicks { disabled.insert("$rageclick") }
         if !lifecycle {
             disabled.insert("$application_opened")
             disabled.insert("$application_backgrounded")
@@ -968,26 +1082,47 @@ public final class FounderHQEvents: @unchecked Sendable {
         capture("$application_opened", properties: properties)
     }
 
+    /**
+     Sends what is queued now.
+
+     An app that calls this is usually about to be killed, or is a test, so
+     the retry ladder stands aside: waiting events go out with the rest.
+     The flushes the SDK schedules for itself honour the ladder instead —
+     see `flushOnSchedule`.
+     */
     @discardableResult
     public func flush() async -> Bool {
         await initialization?.value
         await invocationSnapshot()?.value
-        return await flushCore()
+        return await flushCore(respectRetryLadder: false)
+    }
+
+    /** The timer, the flushAt threshold, and going to background. */
+    @discardableResult
+    func flushOnSchedule() async -> Bool {
+        await initialization?.value
+        await invocationSnapshot()?.value
+        return await flushCore(respectRetryLadder: true)
     }
 
     private let flushGate = FlushGate()
 
-    private func flushCore() async -> Bool {
+    private func flushCore(respectRetryLadder: Bool) async -> Bool {
         // Timer, lifecycle, and manual flushes share one in-flight request so
         // two callers can never send the same queue head or rotate identity
         // twice.
-        await flushGate.run { await self.flushBatch() }
+        await flushGate.run {
+            await self.flushBatch(respectRetryLadder: respectRetryLadder)
+        }
     }
 
-    private func flushBatch() async -> Bool {
+    private func flushBatch(respectRetryLadder: Bool) async -> Bool {
         // The ingest endpoint rejects batches over 100 items; an unclamped
         // flushAt above that would retry the same oversized batch forever.
-        let events = await state.peek(limit: min(100, max(1, configuration.flushAt)))
+        let events = await state.peek(
+            limit: min(100, max(1, configuration.flushAt)),
+            respectRetryLadder: respectRetryLadder
+        )
         guard !events.isEmpty else { return true }
         let envelope = EventEnvelope(
             sentAt: isoString(dependencies.clock.now()),
@@ -1004,20 +1139,56 @@ public final class FounderHQEvents: @unchecked Sendable {
         do {
             request.httpBody = try JSONEncoder().encode(envelope)
             let response = try await dependencies.transport.send(request)
-            guard (200..<300).contains(response.statusCode) else { return false }
+            guard (200..<300).contains(response.statusCode) else {
+                await countFailedAttempt(
+                    events.map(\.uuid),
+                    reason: "the ingest API answered \(response.statusCode)"
+                )
+                return false
+            }
             let ack = try JSONDecoder().decode(EventAck.self, from: response.data)
-            await state.remove(uuids: Set(
+            let settled = Set(
                 ack.results.compactMap { uuid, result in
                     result.result == "retry" ? nil : uuid
                 }
-            ))
+            )
+            await state.remove(uuids: settled)
             if let directive = ack.directives?.first(where: { $0.type == "rotate_distinct_id" }),
                let identify = events.first(where: { $0.event == "$identify" }) {
                 await state.retryIdentify(identify, directiveId: directive.distinctId)
             }
-            return !ack.results.values.contains { $0.result == "retry" }
+            // Anything the API neither accepted nor rejected stays queued, so it
+            // counts as a failed attempt too. Without that an event the API
+            // silently omits would sit in the queue with no attempt ever spent.
+            let unsettled = events.map(\.uuid).filter { !settled.contains($0) }
+            guard unsettled.isEmpty else {
+                await countFailedAttempt(unsettled, reason: "the ingest API asked for a retry")
+                return false
+            }
+            return true
         } catch {
+            await countFailedAttempt(
+                events.map(\.uuid),
+                reason: "the batch never reached the ingest API"
+            )
             return false
+        }
+    }
+
+    /**
+     Spends one delivery attempt per event, moves each one on to its next rung
+     of the retry ladder, and reports the ones that ran off the end. A waiting
+     event is skipped by later flushes instead of blocking them, so a fresh
+     event still goes out while an older one serves its wait.
+     */
+    private func countFailedAttempt(_ uuids: [String], reason: String) async {
+        let dropped = await state.countFailedAttempt(uuids: uuids)
+        guard !dropped.isEmpty else { return }
+        founderHQDebugLog(configuration.debug) {
+            """
+            dropped \(dropped.count) event(s) after \(max(0, configuration.maxRetries) + 1) \
+            delivery attempts: \(reason)
+            """
         }
     }
 
@@ -1039,6 +1210,7 @@ public final class FounderHQEvents: @unchecked Sendable {
             await captureCore("$session_start", properties: [:])
         }
         let identity = captureIdentity.identity
+        sessionSnapshot.set(identity.sessionId)
         var automatic = dependencies.platformFacts.properties()
         automatic["$platform"] = .string("ios")
         automatic["$device_id"] = .string(identity.anonymousId)
@@ -1083,7 +1255,9 @@ public final class FounderHQEvents: @unchecked Sendable {
             )
         )
         await state.enqueue(event)
-        if await state.queueCount >= configuration.flushAt { _ = await flushCore() }
+        if await state.queueCount >= configuration.flushAt {
+            _ = await flushCore(respectRetryLadder: true)
+        }
     }
 
     private func captureControlCore(
@@ -1151,7 +1325,7 @@ public final class FounderHQEvents: @unchecked Sendable {
             timer = Timer.scheduledTimer(
                 withTimeInterval: configuration.flushInterval,
                 repeats: true
-            ) { [weak self] _ in Task { _ = await self?.flush() } }
+            ) { [weak self] _ in Task { _ = await self?.flushOnSchedule() } }
         }
     }
 
@@ -1175,7 +1349,7 @@ public final class FounderHQEvents: @unchecked Sendable {
             guard let self else { return }
             Task {
                 await self.recordLifecycleAndWait("background")
-                _ = await self.flush()
+                _ = await self.flushOnSchedule()
             }
         })
         #endif
@@ -1184,6 +1358,65 @@ public final class FounderHQEvents: @unchecked Sendable {
     private func armAutomaticCapture() async {
         if await capturePolicy.lifecycle { startLifecycleCapture() }
         if await capturePolicy.screens { await installScreenCaptureIfNeeded() }
+        await installInteractionCaptureIfNeeded()
+        installTracingHeadersIfNeeded()
+    }
+
+    private func installInteractionCaptureIfNeeded() async {
+        #if canImport(UIKit)
+        // The effective policy, not the shipped default: remote config can
+        // switch element capture on for an app that shipped with it off, and
+        // the swizzle has to be in place before the next tap.
+        if await capturePolicy.elements, !elementCaptureInstalled {
+            elementCaptureInstalled = true
+            await MainActor.run {
+                FounderHQInteractionCapture.install(client: self, debug: configuration.debug)
+            }
+        }
+        #endif
+        #if canImport(UIKit) && canImport(UserNotifications)
+        if configuration.capturePushNotificationOpened, !pushCaptureInstalled {
+            pushCaptureInstalled = true
+            await MainActor.run {
+                FounderHQPushCapture.install(client: self, debug: configuration.debug)
+            }
+        }
+        #endif
+    }
+
+    private func installTracingHeadersIfNeeded() {
+        guard let hostnames = configuration.tracingHeaders,
+              !hostnames.isEmpty,
+              !tracingHeadersInstalled
+        else { return }
+        tracingHeadersInstalled = true
+        FounderHQNetworkTracing.install(
+            client: self,
+            hostnames: hostnames,
+            ingestHostname: configuration.host.host,
+            debug: configuration.debug
+        )
+    }
+
+    /**
+     The session id as of the last capture, read without awaiting the state
+     actor. The URLSession hook runs on the caller's thread and must never
+     block their request to look one up.
+     */
+    func currentTracingSessionId() -> String? { sessionSnapshot.current }
+
+    /**
+     Whether element capture may report right now, read without awaiting the
+     capture-policy actor. The UIKit hooks run inside the frame UIKit is
+     already drawing, so they must never suspend to ask.
+     */
+    var elementCaptureEnabled: Bool { interactionSnapshot.elements }
+
+    /// Whether a run of taps on one element may raise `$rageclick`.
+    var rageClickCaptureEnabled: Bool { interactionSnapshot.rageClicks }
+
+    private func refreshSessionSnapshot() async {
+        sessionSnapshot.set(await state.isOptedOut ? nil : await state.currentSessionId())
     }
 
     private func installScreenCaptureIfNeeded() async {
@@ -1266,17 +1499,29 @@ private actor AutomaticCapturePolicy {
     private(set) var lifecycle: Bool
     private(set) var screens: Bool
     private(set) var sessions: Bool
+    private(set) var elements: Bool
+    private(set) var rageClicks: Bool
 
-    init(lifecycle: Bool, screens: Bool, sessions: Bool) {
+    init(lifecycle: Bool, screens: Bool, sessions: Bool, elements: Bool) {
         self.lifecycle = lifecycle
         self.screens = screens
         self.sessions = sessions
+        self.elements = elements
+        self.rageClicks = elements
     }
 
-    func apply(lifecycle: Bool?, screens: Bool?, sessions: Bool?) {
+    func apply(
+        lifecycle: Bool?,
+        screens: Bool?,
+        sessions: Bool?,
+        elements: Bool?,
+        rageClicks: Bool?
+    ) {
         if let lifecycle { self.lifecycle = lifecycle }
         if let screens { self.screens = screens }
         if let sessions { self.sessions = sessions }
+        if let elements { self.elements = elements }
+        if let rageClicks { self.rageClicks = rageClicks }
     }
 }
 
@@ -1288,6 +1533,9 @@ private actor EventsState {
     private let uuid: any FounderHQUUIDProvider
     private let maxQueueSize: Int
     private let eventTTL: TimeInterval
+    private let maxRetries: Int
+    private let retryLadder: [TimeInterval?]
+    private let debug: Bool
     private var value: PersistedState
     let wasRestored: Bool
     let needsSessionStart: Bool
@@ -1300,7 +1548,10 @@ private actor EventsState {
         clock: any FounderHQClock,
         uuid: any FounderHQUUIDProvider,
         maxQueueSize: Int,
-        eventTTL: TimeInterval
+        eventTTL: TimeInterval,
+        maxRetries: Int,
+        retryLadder: [TimeInterval?],
+        debug: Bool
     ) {
         self.key = key
         self.storage = storage
@@ -1311,6 +1562,9 @@ private actor EventsState {
         let boundedEventTTL = max(0, eventTTL)
         self.maxQueueSize = boundedQueueSize
         self.eventTTL = boundedEventTTL
+        self.maxRetries = max(0, maxRetries)
+        self.retryLadder = retryLadder
+        self.debug = debug
         if let data = storage.data(forKey: key),
            let restored = try? JSONDecoder().decode(PersistedState.self, from: data) {
             if isUUIDv7(restored.sessionId) {
@@ -1332,6 +1586,12 @@ private actor EventsState {
                 maxQueueSize: boundedQueueSize,
                 eventTTL: boundedEventTTL
             )
+            value.deliverySchedule = Self.scheduleForNewProcess(
+                schedule: value.deliverySchedule,
+                legacyAttempts: value.deliveryAttempts,
+                queue: value.queue
+            )
+            value.deliveryAttempts = nil
             storage.set(try? JSONEncoder().encode(value), forKey: key)
             wasRestored = true
         } else {
@@ -1351,7 +1611,8 @@ private actor EventsState {
                 pendingSetOnce: [:],
                 optedOut: optOutByDefault,
                 queue: [],
-                account: nil
+                account: nil,
+                deliveryAttempts: nil
             )
             wasRestored = false
             needsSessionStart = true
@@ -1361,6 +1622,7 @@ private actor EventsState {
 
     var isOptedOut: Bool { value.optedOut }
     var distinctId: String { value.distinctId }
+    func currentSessionId() -> String { value.sessionId }
     var registered: JSONObject { value.registered }
     var queueCount: Int { value.queue.count }
 
@@ -1465,7 +1727,10 @@ private actor EventsState {
     }
     func setOptedOut(_ optedOut: Bool) {
         value.optedOut = optedOut
-        if optedOut { value.queue = [] }
+        if optedOut {
+            value.queue = []
+            value.deliveryAttempts = nil
+        }
         persist()
     }
 
@@ -1488,7 +1753,8 @@ private actor EventsState {
             pendingSetOnce: [:],
             optedOut: optedOut,
             queue: [],
-            account: nil
+            account: nil,
+            deliveryAttempts: nil
         )
         persist()
         return .init(token: id, enabled: enabled)
@@ -1535,20 +1801,116 @@ private actor EventsState {
         }
         persist()
     }
-    func peek(limit: Int) -> [EventPayload] {
+    /**
+     The oldest events that are allowed out right now. An event still serving
+     a rung of the retry ladder is skipped, not counted as an attempt, and a
+     newer event behind it goes in its place.
+     */
+    func peek(limit: Int, respectRetryLadder: Bool = true) -> [EventPayload] {
         pruneQueue()
         persist()
-        return Array(value.queue.prefix(limit))
+        guard respectRetryLadder else {
+            return Array(value.queue.prefix(limit))
+        }
+        let now = clock.now()
+        let schedule = value.deliverySchedule ?? [:]
+        return Array(
+            value.queue
+                .filter { Self.isEligible(schedule[$0.uuid], now: now) }
+                .prefix(limit)
+        )
+    }
+
+    private static func isEligible(_ entry: DeliverySchedule?, now: Date) -> Bool {
+        guard let entry else { return true }
+        if entry.awaitingLaunch == true { return false }
+        guard let nextEligibleAt = entry.nextEligibleAt else { return true }
+        return now >= nextEligibleAt
+    }
+
+    /**
+     Puts a restored ladder back to work. A timed rung keeps its deadline, so
+     a five minute wait that started before the app was killed still has to
+     finish. The final rung is the one this releases: it waits for a launch
+     rather than for a clock, and this is that launch.
+     */
+    private static func scheduleForNewProcess(
+        schedule: [String: DeliverySchedule]?,
+        legacyAttempts: [String: Int]?,
+        queue: [EventPayload]
+    ) -> [String: DeliverySchedule]? {
+        var restored = schedule ?? [:]
+        // A state file from before the ladder carries a bare attempt count and
+        // no deadline, so those events go out on the next flush.
+        for (uuid, attempts) in legacyAttempts ?? [:] where restored[uuid] == nil {
+            restored[uuid] = DeliverySchedule(
+                attempts: attempts,
+                nextEligibleAt: nil,
+                awaitingLaunch: false
+            )
+        }
+        let queued = Set(queue.map(\.uuid))
+        restored = restored.filter { queued.contains($0.key) }
+        for (uuid, entry) in restored where entry.awaitingLaunch == true {
+            restored[uuid] = DeliverySchedule(
+                attempts: entry.attempts,
+                nextEligibleAt: nil,
+                awaitingLaunch: false
+            )
+        }
+        return restored.isEmpty ? nil : restored
     }
     func remove(uuids: Set<String>) {
         value.queue.removeAll { uuids.contains($0.uuid) }
+        pruneDeliverySchedule()
         persist()
     }
 
     func remove(eventsNamed names: Set<String>) {
         guard !names.isEmpty else { return }
         value.queue.removeAll { names.contains($0.event) }
+        pruneDeliverySchedule()
         persist()
+    }
+
+    /**
+     Charges one delivery attempt to every named event, moves each one on to
+     its next rung of the retry ladder, and removes the ones that have run off
+     the end of it. Returns the removed uuids so the caller can report them.
+
+     The ladder itself is `founderHQRetryLadder`, cut to `maxRetries` rungs
+     from the front. The counter and the deadline live beside the queue rather
+     than inside the event, because an event carries only what the ingest API
+     is allowed to see.
+     */
+    func countFailedAttempt(uuids: [String]) -> [String] {
+        guard !uuids.isEmpty else { return [] }
+        let rungs = Array(retryLadder.prefix(maxRetries))
+        let now = clock.now()
+        var schedule = value.deliverySchedule ?? [:]
+        var dropped: [String] = []
+        for uuid in uuids {
+            let spent = (schedule[uuid]?.attempts ?? 0) + 1
+            guard spent <= rungs.count else {
+                dropped.append(uuid)
+                schedule.removeValue(forKey: uuid)
+                continue
+            }
+            schedule[uuid] = DeliverySchedule(
+                attempts: spent,
+                // A nil rung is the last one: it waits for the next launch, so
+                // it carries no deadline a flush in this process could reach.
+                nextEligibleAt: rungs[spent - 1].map(now.addingTimeInterval),
+                awaitingLaunch: rungs[spent - 1] == nil
+            )
+        }
+        value.deliverySchedule = schedule.isEmpty ? nil : schedule
+        if !dropped.isEmpty {
+            let exhausted = Set(dropped)
+            value.queue.removeAll { exhausted.contains($0.uuid) }
+        }
+        persist()
+        return dropped
     }
 
     func retryIdentify(_ event: EventPayload, directiveId: String?) {
@@ -1608,12 +1970,27 @@ private actor EventsState {
     }
 
     private func pruneQueue() {
+        let before = value.queue.count
         value.queue = pruneEventQueue(
             value.queue,
             now: clock.now(),
             maxQueueSize: maxQueueSize,
             eventTTL: eventTTL
         )
+        if value.queue.count < before {
+            founderHQDebugLog(debug) {
+                "dropped \(before - value.queue.count) event(s) over the queue size or age cap"
+            }
+        }
+        pruneDeliverySchedule()
+    }
+
+    /** Forgets the ladder position of events that already left the queue. */
+    private func pruneDeliverySchedule() {
+        guard let schedule = value.deliverySchedule, !schedule.isEmpty else { return }
+        let queued = Set(value.queue.map(\.uuid))
+        let kept = schedule.filter { queued.contains($0.key) }
+        value.deliverySchedule = kept.isEmpty ? nil : kept
     }
 }
 
@@ -1832,6 +2209,36 @@ private struct PersistedState: Codable {
     var optedOut: Bool
     var queue: [EventPayload]
     var account: AccountState?
+    /**
+     Plain attempt counts per queued event uuid, written by SDK versions from
+     before the retry ladder. The SDK still decodes them, migrates them into
+     `deliverySchedule` on the next launch, and then writes null here.
+     */
+    var deliveryAttempts: [String: Int]?
+    /**
+     Where each queued event stands on the retry ladder: the attempts it has
+     spent and the moment it may go out again. It sits outside the queue so
+     the wire payload stays exactly what the ingest API defines, and it is
+     optional so a state file written before this field still decodes.
+     */
+    var deliverySchedule: [String: DeliverySchedule]?
+}
+
+/** One queued event's place on the retry ladder. */
+private struct DeliverySchedule: Codable {
+    /// Delivery attempts already spent and failed.
+    var attempts: Int
+    /**
+     The earliest moment a flush may send this event again. Nil means the
+     event is eligible now.
+     */
+    var nextEligibleAt: Date?
+    /**
+     The event is parked on the last rung, which no clock releases. Only a new
+     process clears it, which is what makes that rung fire exactly once per
+     app launch.
+     */
+    var awaitingLaunch: Bool?
 }
 private struct AccountState: Codable, Sendable {
     let key: String
@@ -1965,6 +2372,64 @@ private final class FounderHQOneShotPreparation: @unchecked Sendable {
         lock.unlock()
         pending?.resume(returning: value)
     }
+}
+
+/**
+ The last session id the SDK captured with, readable without awaiting the state
+ actor. Only the tracing header needs this: it runs inside the app's own
+ URLSession call and cannot suspend.
+ */
+final class FounderHQSessionSnapshot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+
+    var current: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func set(_ value: String?) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+}
+
+/**
+ The element-capture switches as of the last config the SDK applied, readable
+ without an `await`. The UIKit hooks are synchronous and run on the main
+ thread, so they cannot suspend on the capture-policy actor to ask.
+ */
+final class FounderHQInteractionCaptureSnapshot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var elementsValue = false
+    private var rageClicksValue = false
+
+    var elements: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return elementsValue
+    }
+
+    var rageClicks: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return rageClicksValue
+    }
+
+    func set(elements: Bool, rageClicks: Bool) {
+        lock.lock()
+        elementsValue = elements
+        rageClicksValue = rageClicks
+        lock.unlock()
+    }
+}
+
+/** Prints only when the app asked for it through `debug`. */
+func founderHQDebugLog(_ enabled: Bool, _ message: () -> String) {
+    guard enabled else { return }
+    NSLog("[FounderHQEvents] %@", message())
 }
 
 private final class FounderHQLockedBox<Value>: @unchecked Sendable {
@@ -2101,6 +2566,13 @@ private func normalizeDistinctId(_ value: String) -> String? {
     else { return nil }
     return distinctId
 }
+
+/**
+ The wait before each retry, in seconds, with `nil` for the final rung: that
+ one waits for the next process launch rather than for a clock. See
+ `FounderHQEventsConfiguration.maxRetries` for why the ladder looks like this.
+ */
+let founderHQRetryLadder: [TimeInterval?] = [30, 30, 120, 300, nil]
 
 private func pruneEventQueue(
     _ queue: [EventPayload],

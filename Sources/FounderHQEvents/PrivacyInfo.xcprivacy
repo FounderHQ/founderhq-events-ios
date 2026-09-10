@@ -2,6 +2,49 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	  What this SDK collects. Product interaction covers screen views, taps,
+	  and the events an app sends; other usage data covers the properties an
+	  app attaches to them. Both are for analytics only.
+
+	  Not linked and not tracking as shipped: the SDK's own identifier is
+	  random, and it is never joined with data from other companies' apps. An
+	  app that calls `identify` with its own user id links the data itself,
+	  and answers for that in its own App Privacy form.
+	-->
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeProductInteraction</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherUsageData</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAnalytics</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+	  Required-reason APIs. UserDefaults is the only one this SDK touches, and
+	  only for its own queue and identity (CA92.1). It reads no boot time, no
+	  file timestamps, no disk space, no advertising identifier, and no
+	  keychain, so nothing else belongs here.
+	-->
 	<key>NSPrivacyAccessedAPITypes</key>
 	<array>
 		<dict>
@@ -13,5 +56,9 @@
 			</array>
 		</dict>
 	</array>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
 </dict>
 </plist>

@@ -1,21 +1,28 @@
 {
   "repository": "FounderHQ/founderhq-events-ios",
-  "version": "0.8.0",
-  "sourceCommit": "5fa498bd63580b4d2bb111f31d0ab93e503f40e8",
+  "version": "1.0.0",
+  "sourceCommit": "f1468fd488689243c37b5acf47a94d541fe4eaf7",
   "files": {
     ".github/workflows/release.yml": "f8f80a55ba9c8f69785cc99382881962b5288cba8bf629ef141e4a5e6d6d9404",
     ".gitignore": "14381eea8ee07ee2479db564fb75f9814f9a510041eb1eac35da5bd01adfc3c8",
     "Examples/FounderHQEventsSample/FounderHQEventsSampleApp.swift": "844ef28aca636ba01d25788b4644892d7b76a165b10b22d493bc3de089c8e7b6",
-    "FounderHQEvents.podspec": "c5fb1f9e1f22157274ad2eb384607af51023027efaaa296aae2cbc2b5f844bd2",
+    "FounderHQEvents.podspec": "f7da17eb8b543e5eb4981138e5da75e149496d820da9400025efb3ca3d8a462c",
     "LICENSE": "11266b70b5ea51167849f8ff2fc81558da90acb971a670e5ee7787d8151c9ff0",
     "Package.swift": "fe681d617d9803220929080e6c5955ca7e9e8df80d3178625a08de7eefc214b7",
-    "README.md": "6466b1ac853b7d7434d76a6523bca6db1473610ebb399bf8a64d0ad272d98098",
-    "Sources/FounderHQEvents/FounderHQEvents.swift": "6232e50ccc7c8c04a1730daa74cdeaa70d0242af6dccfe07ee86bc8107a7fcf8",
-    "Sources/FounderHQEvents/GeneratedProtocolConstants.swift": "2040abf0325e2d1f518221272d0f4873b9fa5a3f266f8cc25f120ebf74ad78a9",
-    "Sources/FounderHQEvents/PrivacyInfo.xcprivacy": "dc8d7e1f9a7da7f3381f30746b59206ee62ce225b69fe3bcbb66234f8459be35",
+    "README.md": "a4b0d504e720834cc994fbfaffa771272ac7100b50db1d0f40169dcf226cc317",
+    "Sources/FounderHQEvents/ElementCapture.swift": "e6362a22a052b6c939f2724c7880a479b230a3a97e5bf2ec94a3ecdd02e852d8",
+    "Sources/FounderHQEvents/FounderHQEvents.swift": "a9b2633a22ac6006a6ab8b889e0b92a45682096b7c9433a23f910c8f62811f4e",
+    "Sources/FounderHQEvents/GeneratedProtocolConstants.swift": "bb78f244e96919832aa3b43e9ccd102940bd325d587c3e83c2070defe50d0391",
+    "Sources/FounderHQEvents/NetworkTracing.swift": "4406ce7056c4b0ed991351ec1b0c33a00c704b02974733bed043261e8a418100",
+    "Sources/FounderHQEvents/PrivacyInfo.xcprivacy": "944bcd72a3bfdf5e2e5581e0279de457da496c3b365bfbf0026008fb009e797c",
+    "Sources/FounderHQEvents/PushCapture.swift": "a9f8a06b50538bc2c7ef26d777594250590fb9b702ed3df19bcb985db62b8eb5",
     "Sources/FounderHQEvents/ScreenCapture.swift": "6320e1e9d540c626994f06cd81fd3301f0e7d6c78b45e2e77b7f65a66f75485a",
     "Sources/FounderHQEvents/SwiftUIScreen.swift": "9e447d79d94eba21e63a70a1ca8a6f50271f3e3edaf17bde8753dd2bf916a7cc",
-    "Tests/FounderHQEventsTests/ProtocolTests.swift": "24c47fff595c6e0b2c855ae04c7c35b0ee70ca162741415539cc81e4d3a94287",
-    "fixtures/conformance-v2.json": "cc606c65516d924e772bbe2c577ce88b1bcf9f03914b57abb98141da4eed67b2"
+    "Tests/FounderHQEventsTests/ProtocolTests.swift": "145f3c3bd711eeff17aaf1f74daff1eb65fb3699add4e8294ce3f086934a4ee5",
+    "Tests/FounderHQEventsTests/UIKitCaptureTests.swift": "462b9a1fcb9c820a3df0d586edaa552ed5692d211fbbe8741009729e120b3a00",
+    "Tools/InteractionHostApp/main.swift": "8134b045b8678eca80465b9f539e8e4ca1a76888cdae3e80f1a4994aef221788",
+    "Tools/run-interaction-host-app.sh": "71729211f007a66333b3aae7600d682ace44756bea57582d3ec659a3c0e680d6",
+    "Tools/run-simulator-tests.sh": "166af44a966f7183d9a66d35dc2177bc5efe1670725b1dffdc91c5bb9603f85e",
+    "fixtures/conformance-v2.json": "564e39cec13432489bf14786954f8b2f560c09f976659e5ffc56669a7c96e97d"
   }
 }

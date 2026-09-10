@@ -19,6 +19,7 @@ public enum FounderHQProtocolConstants {
     "$application_updated",
     "$application_opened",
     "$application_backgrounded",
+    "$push_notification_opened",
     ]
 
     public static let campaignProperties: [String] = [
@@ -62,4 +63,16 @@ public enum FounderHQProtocolConstants {
     "\"undefined\"",
     "\"null\"",
     ]
+
+    /// Longest element text an event may carry.
+    public static let elementTextMaxLength = 255
+
+    /// How many ancestors of the tapped element travel with it.
+    public static let elementAncestorLimit = 5
+
+    /// Taps on one element inside the window that make a rage tap.
+    public static let rageTapCount = 3
+
+    /// The rage-tap window, and the quiet time before a second one may fire.
+    public static let rageWindowMillis = 1000
 }

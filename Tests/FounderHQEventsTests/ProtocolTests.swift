@@ -193,6 +193,234 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(queue.compactMap { $0["event"] as? String }, ["fresh"])
     }
 
+    /// `maxRetries: 2` keeps the first two rungs, so the ladder is 30s, 30s, stop.
+    /**
+     A manual `flush()` means "send now", so it ignores the ladder and takes
+     waiting events with it. Only the flushes the SDK schedules for itself
+     wait, which is why every ladder test below drives `flushOnSchedule()`.
+     Android draws the same line.
+     */
+    func testAManualFlushIgnoresTheLadderAndSendsWaitingEvents() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_760_000_000))
+        let transport = TestTransport()
+        transport.online = false
+        let client = FounderHQEvents(
+            apiKey: "fhq_pk_manualflush",
+            configuration: .init(
+                flushAt: 100,
+                flushInterval: 0,
+                captureLifecycle: false,
+                captureScreens: false,
+                captureSessions: false,
+                captureInstallUpdates: false,
+                remoteConfig: false
+            ),
+            dependencies: .init(
+                clock: clock,
+                uuid: TestUUIDProvider(
+                    uuids: (1...8).map {
+                        "20000000-0000-4000-8000-\(String(format: "%012d", $0))"
+                    },
+                    sessionIds: ["01989f2e-7800-7000-8000-000000000002"]
+                ),
+                storage: TestStorage(),
+                transport: transport,
+                platformFacts: TestFacts(values: [:])
+            )
+        )
+        await client.captureAndWait("ladder.manual")
+        _ = await client.flushOnSchedule()
+        // That attempt failed, so the event now waits 30s on the first rung.
+        transport.requests.removeAll()
+        transport.online = true
+
+        _ = await client.flushOnSchedule()
+        XCTAssertTrue(
+            transport.requests.isEmpty,
+            "a scheduled flush must leave a waiting event alone"
+        )
+
+        _ = await client.flush()
+        XCTAssertFalse(
+            transport.requests.isEmpty,
+            "a manual flush means send now, ladder or not"
+        )
+    }
+
+    func testATruncatedLadderWaitsItsTwoRungsAndThenGivesUp() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_786_694_000))
+        let transport = TestTransport()
+        transport.online = false
+        let client = FounderHQEvents(
+            apiKey: "fhq_pk_retries",
+            configuration: .init(
+                flushAt: 100,
+                flushInterval: 0,
+                captureLifecycle: false,
+                captureScreens: false,
+                captureSessions: false,
+                captureInstallUpdates: false,
+                remoteConfig: false,
+                maxRetries: 2
+            ),
+            dependencies: .init(
+                clock: clock,
+                uuid: TestUUIDProvider(
+                    uuids: (1...8).map { "10000000-0000-4000-8000-\(String(format: "%012d", $0))" },
+                    sessionIds: ["01989f2e-7800-7000-8000-000000000001"]
+                ),
+                storage: TestStorage(),
+                transport: transport,
+                platformFacts: TestFacts(values: [:])
+            )
+        )
+        await client.captureAndWait("retry.me")
+
+        // The first attempt goes out at once and fails.
+        var flushed = await client.flushOnSchedule()
+        XCTAssertFalse(flushed)
+        XCTAssertEqual(transport.eventRequests.count, 1)
+
+        // A flush inside the 30 second wait skips the event instead of
+        // spending one of its attempts on it.
+        flushed = await client.flushOnSchedule()
+        XCTAssertTrue(flushed)
+        XCTAssertEqual(transport.eventRequests.count, 1)
+        let queuedNow1 = try await queuedEvents(of: client)
+        XCTAssertEqual(queuedNow1, ["retry.me"])
+
+        clock.value.addTimeInterval(30)
+        flushed = await client.flushOnSchedule()
+        XCTAssertFalse(flushed)
+        XCTAssertEqual(transport.eventRequests.count, 2)
+        let queuedNow2 = try await queuedEvents(of: client)
+        XCTAssertEqual(queuedNow2, ["retry.me"])
+
+        clock.value.addTimeInterval(30)
+        flushed = await client.flushOnSchedule()
+        XCTAssertFalse(flushed)
+        XCTAssertEqual(transport.eventRequests.count, 3)
+        let queuedNow3 = try await queuedEvents(of: client)
+        XCTAssertEqual(queuedNow3, [String]())
+
+        clock.value.addTimeInterval(30)
+        _ = await client.flushOnSchedule()
+        XCTAssertEqual(transport.eventRequests.count, 3)
+    }
+
+    /**
+     The whole ladder: send now, wait 30s, 30s, 2min, 5min, and then one last
+     attempt that only a new process releases.
+     */
+    func testTheFullLadderWaitsEachRungAndKeepsItsLastOneForTheNextLaunch() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_786_694_000))
+        let storage = TestStorage()
+        let transport = TestTransport()
+        transport.online = false
+        let configuration = FounderHQEventsConfiguration(
+            flushAt: 100,
+            flushInterval: 0,
+            captureLifecycle: false,
+            captureScreens: false,
+            captureSessions: false,
+            captureInstallUpdates: false,
+            remoteConfig: false
+        )
+        XCTAssertEqual(configuration.maxRetries, 5)
+        let dependencies = FounderHQEventsDependencies(
+            clock: clock,
+            uuid: TestUUIDProvider(
+                uuids: (1...8).map { "10000000-0000-4000-8000-\(String(format: "%012d", $0))" },
+                sessionIds: ["01989f2e-7800-7000-8000-000000000001"]
+            ),
+            storage: storage,
+            transport: transport,
+            platformFacts: TestFacts(values: [:])
+        )
+        let client = FounderHQEvents(
+            apiKey: "fhq_pk_ladder",
+            configuration: configuration,
+            dependencies: dependencies
+        )
+        await client.captureAndWait("ladder.me")
+
+        // Rung by rung: a flush one second early changes nothing, and a flush
+        // on time spends exactly one attempt.
+        for wait in [0, 30, 30, 120, 300] {
+            if wait > 0 {
+                clock.value.addTimeInterval(TimeInterval(wait) - 1)
+                let early = await client.flushOnSchedule()
+                XCTAssertTrue(early, "a flush inside the \(wait)s rung must skip the event")
+                clock.value.addTimeInterval(1)
+            }
+            let onTime = await client.flushOnSchedule()
+            XCTAssertFalse(onTime)
+        }
+        XCTAssertEqual(transport.eventRequests.count, 5)
+
+        // The last rung answers to a launch, not to a clock.
+        clock.value.addTimeInterval(60 * 60)
+        let stalled = await client.flushOnSchedule()
+        XCTAssertTrue(stalled)
+        XCTAssertEqual(transport.eventRequests.count, 5)
+        let queuedNow4 = try await queuedEvents(of: client)
+        XCTAssertEqual(queuedNow4, ["ladder.me"])
+
+        let relaunched = FounderHQEvents(
+            apiKey: "fhq_pk_ladder",
+            configuration: configuration,
+            dependencies: dependencies
+        )
+        await relaunched.readyForCapture()
+        let lastChance = await relaunched.flush()
+        XCTAssertFalse(lastChance)
+        XCTAssertEqual(transport.eventRequests.count, 6)
+        let queuedNow5 = try await queuedEvents(of: relaunched)
+        XCTAssertEqual(queuedNow5, [String]())
+    }
+
+    /// The 24 hour TTL outranks the ladder: an unsent event still expires.
+    func testTheAgeCapDropsAnEventThatStillHasLadderRungsLeft() async throws {
+        let clock = TestClock(Date(timeIntervalSince1970: 1_786_694_000))
+        let transport = TestTransport()
+        transport.online = false
+        let client = FounderHQEvents(
+            apiKey: "fhq_pk_ladder_ttl",
+            configuration: .init(
+                flushAt: 100,
+                flushInterval: 0,
+                captureLifecycle: false,
+                captureScreens: false,
+                captureSessions: false,
+                captureInstallUpdates: false,
+                remoteConfig: false,
+                eventTTL: 60
+            ),
+            dependencies: .init(
+                clock: clock,
+                uuid: TestUUIDProvider(
+                    uuids: (1...8).map { "10000000-0000-4000-8000-\(String(format: "%012d", $0))" },
+                    sessionIds: ["01989f2e-7800-7000-8000-000000000001"]
+                ),
+                storage: TestStorage(),
+                transport: transport,
+                platformFacts: TestFacts(values: [:])
+            )
+        )
+        await client.captureAndWait("stale.me")
+
+        let first = await client.flushOnSchedule()
+        XCTAssertFalse(first)
+        XCTAssertEqual(transport.eventRequests.count, 1)
+
+        clock.value.addTimeInterval(61)
+        let expired = await client.flushOnSchedule()
+        XCTAssertTrue(expired)
+        XCTAssertEqual(transport.eventRequests.count, 1)
+        let queuedNow6 = try await queuedEvents(of: client)
+        XCTAssertEqual(queuedNow6, [String]())
+    }
+
     func testPublicCaptureAndAccountCallsPreserveInvocationOrder() async throws {
         let uuids = TestUUIDProvider(
             uuids: (1...20).map {
@@ -841,6 +1069,15 @@ private func seedInitialStorage(_ fixture: Fixture, storage: TestStorage) throws
     }
     let data = try JSONSerialization.data(withJSONObject: state)
     storage.set(data, forKey: "com.founderhq.events.v2.fhq_pk_fixture")
+}
+
+private func queuedEvents(of client: FounderHQEvents) async throws -> [String] {
+    let persisted = await client.persistedStateData()
+    let state = try XCTUnwrap(
+        JSONSerialization.jsonObject(with: try XCTUnwrap(persisted)) as? [String: Any]
+    )
+    let queue = try XCTUnwrap(state["queue"] as? [[String: Any]])
+    return queue.compactMap { $0["event"] as? String }
 }
 
 private func normalizePersistedState(_ state: [String: Any]) -> [String: Any] {
