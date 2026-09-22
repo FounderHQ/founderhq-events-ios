@@ -1,17 +1,17 @@
 {
   "repository": "FounderHQ/founderhq-events-ios",
-  "version": "1.0.0",
-  "sourceCommit": "293cab985e461819bf6aab56ae68eb1de65af869",
+  "version": "1.0.2",
+  "sourceCommit": "7e358aab484980c19be75518a53c3735539d853c",
   "files": {
     ".github/workflows/release.yml": "f8f80a55ba9c8f69785cc99382881962b5288cba8bf629ef141e4a5e6d6d9404",
     ".gitignore": "14381eea8ee07ee2479db564fb75f9814f9a510041eb1eac35da5bd01adfc3c8",
     "Examples/FounderHQEventsSample/FounderHQEventsSampleApp.swift": "844ef28aca636ba01d25788b4644892d7b76a165b10b22d493bc3de089c8e7b6",
-    "FounderHQEvents.podspec": "f7da17eb8b543e5eb4981138e5da75e149496d820da9400025efb3ca3d8a462c",
+    "FounderHQEvents.podspec": "09b0e2736e211c58db96e78d305a52ecb393c07d160113b918232c75c1b4760b",
     "LICENSE": "11266b70b5ea51167849f8ff2fc81558da90acb971a670e5ee7787d8151c9ff0",
     "Package.swift": "fe681d617d9803220929080e6c5955ca7e9e8df80d3178625a08de7eefc214b7",
-    "README.md": "a4b0d504e720834cc994fbfaffa771272ac7100b50db1d0f40169dcf226cc317",
+    "README.md": "4188dbbf0b437d411fc8a0267eb815b0e06c98a2db6096016aec248979d8c243",
     "Sources/FounderHQEvents/ElementCapture.swift": "e6362a22a052b6c939f2724c7880a479b230a3a97e5bf2ec94a3ecdd02e852d8",
-    "Sources/FounderHQEvents/FounderHQEvents.swift": "a9b2633a22ac6006a6ab8b889e0b92a45682096b7c9433a23f910c8f62811f4e",
+    "Sources/FounderHQEvents/FounderHQEvents.swift": "b58e6f97056cd4d3e5db625355fb2f7fd8b686908dcdcd9cba1e573e9d031c9a",
     "Sources/FounderHQEvents/GeneratedProtocolConstants.swift": "bb78f244e96919832aa3b43e9ccd102940bd325d587c3e83c2070defe50d0391",
     "Sources/FounderHQEvents/NetworkTracing.swift": "4406ce7056c4b0ed991351ec1b0c33a00c704b02974733bed043261e8a418100",
     "Sources/FounderHQEvents/PrivacyInfo.xcprivacy": "944bcd72a3bfdf5e2e5581e0279de457da496c3b365bfbf0026008fb009e797c",
@@ -23,6 +23,6 @@
     "Tools/InteractionHostApp/main.swift": "8134b045b8678eca80465b9f539e8e4ca1a76888cdae3e80f1a4994aef221788",
     "Tools/run-interaction-host-app.sh": "71729211f007a66333b3aae7600d682ace44756bea57582d3ec659a3c0e680d6",
     "Tools/run-simulator-tests.sh": "166af44a966f7183d9a66d35dc2177bc5efe1670725b1dffdc91c5bb9603f85e",
-    "fixtures/conformance-v2.json": "564e39cec13432489bf14786954f8b2f560c09f976659e5ffc56669a7c96e97d"
+    "fixtures/conformance-v2.json": "4dbd18a020f743d43cfd4479f87cd7f4b0a2e9579cf782491840fbfa38cb950a"
   }
 }

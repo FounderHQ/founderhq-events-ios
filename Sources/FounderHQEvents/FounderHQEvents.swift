@@ -277,7 +277,7 @@ public struct FounderHQEventsConfiguration: Sendable {
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "1.0.0"
+    public static let sdkVersion = "1.0.1"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration
@@ -2136,7 +2136,20 @@ public struct FounderHQSystemPlatformFactsProvider: FounderHQPlatformFactsProvid
         output["$device_manufacturer"] = .string("Apple")
         output["$device_name"] = .string(device.name)
         output["$device_model"] = .string(device.model)
-        output["$device_type"] = .string(device.userInterfaceIdiom == .pad ? "Tablet" : "Mobile")
+        // Canonical vocabulary shared with every FounderHQ SDK and the server:
+        // "mobile" | "tablet" | "desktop" | "other" (apps/web/src/lib/event-context.ts).
+        // Versions up to 1.0.0 sent "Mobile" / "Tablet"; the server respells those.
+        // A TV, a car or a headset is a real device that is none of the three,
+        // so it says "other" rather than reporting itself as a phone.
+        let idiom = device.userInterfaceIdiom
+        let deviceType: String
+        switch idiom {
+        case .phone: deviceType = "mobile"
+        case .pad: deviceType = "tablet"
+        case .mac: deviceType = "desktop"
+        default: deviceType = "other"
+        }
+        output["$device_type"] = .string(deviceType)
         output["$os"] = .string(device.systemName)
         output["$os_version"] = .string(device.systemVersion)
         output["$screen_width"] = .number(width)
