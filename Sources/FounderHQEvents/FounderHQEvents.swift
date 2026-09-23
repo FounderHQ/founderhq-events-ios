@@ -137,6 +137,7 @@ public struct FounderHQEventsDependencies: Sendable {
     public var transport: any FounderHQTransport
     public var platformFacts: any FounderHQPlatformFactsProvider
     public var screenCapture: any FounderHQScreenCaptureInstalling
+    public var colorScheme: @MainActor @Sendable () -> String?
 
     public init(
         clock: any FounderHQClock = FounderHQSystemClock(),
@@ -144,7 +145,8 @@ public struct FounderHQEventsDependencies: Sendable {
         storage: any FounderHQStorage = FounderHQUserDefaultsStorage(),
         transport: any FounderHQTransport = FounderHQURLSessionTransport(),
         platformFacts: any FounderHQPlatformFactsProvider = FounderHQSystemPlatformFactsProvider(),
-        screenCapture: any FounderHQScreenCaptureInstalling = FounderHQDefaultScreenCaptureInstaller()
+        screenCapture: any FounderHQScreenCaptureInstalling = FounderHQDefaultScreenCaptureInstaller(),
+        colorScheme: @escaping @MainActor @Sendable () -> String? = { founderHQSystemColorScheme() }
     ) {
         self.clock = clock
         self.uuid = uuid
@@ -152,6 +154,7 @@ public struct FounderHQEventsDependencies: Sendable {
         self.transport = transport
         self.platformFacts = platformFacts
         self.screenCapture = screenCapture
+        self.colorScheme = colorScheme
     }
 }
 
@@ -232,6 +235,11 @@ public struct FounderHQEventsConfiguration: Sendable {
      so a shipping app stays quiet; turn it on while you wire the SDK up.
      */
     public var debug: Bool
+    /// Enriches screens and taps without changing which events are captured.
+    public var autoProperties: FounderHQAutoProperties?
+    /// Runs on the state actor before queueing, including identity retries.
+    /// Purchase control events bypass this hook. Returning nil or throwing drops other events.
+    public var beforeSend: FounderHQBeforeSend?
     public init(
         host: URL = URL(string: "https://i.getfounderhq.com")!,
         flushAt: Int = 20,
@@ -251,7 +259,9 @@ public struct FounderHQEventsConfiguration: Sendable {
         captureElementInteractions: Bool = false,
         tracingHeaders: [String]? = nil,
         capturePushNotificationOpened: Bool = true,
-        debug: Bool = false
+        debug: Bool = false,
+        autoProperties: FounderHQAutoProperties? = nil,
+        beforeSend: FounderHQBeforeSend? = nil
     ) {
         self.host = host
         self.flushAt = flushAt
@@ -272,16 +282,19 @@ public struct FounderHQEventsConfiguration: Sendable {
         self.tracingHeaders = tracingHeaders
         self.capturePushNotificationOpened = capturePushNotificationOpened
         self.debug = debug
+        self.autoProperties = autoProperties
+        self.beforeSend = beforeSend
     }
 }
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "1.0.1"
+    public static let sdkVersion = "1.1.0"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration
     private let dependencies: FounderHQEventsDependencies
+    private let automaticProperties: FounderHQAutomaticProperties
     private let state: EventsState
     private let stateStorageKey: String
     private let capturePolicy: AutomaticCapturePolicy
@@ -307,6 +320,7 @@ public final class FounderHQEvents: @unchecked Sendable {
     ) {
         self.apiKey = apiKey
         self.configuration = configuration
+        self.automaticProperties = FounderHQAutomaticProperties(hook: configuration.autoProperties)
         self.dependencies = dependencies
         self.revenueCatIdentity = revenueCatIdentity
         self.remoteConfigKey = "com.founderhq.events.config.v1.\(String(apiKey.prefix(16)))"
@@ -337,7 +351,8 @@ public final class FounderHQEvents: @unchecked Sendable {
             eventTTL: configuration.eventTTL,
             maxRetries: configuration.maxRetries,
             retryLadder: founderHQRetryLadder,
-            debug: configuration.debug
+            debug: configuration.debug,
+            beforeSend: configuration.beforeSend
         )
         startTimer()
         initialization = Task { [weak self] in
@@ -555,12 +570,50 @@ public final class FounderHQEvents: @unchecked Sendable {
 
     private func screenOperation(_ name: String, properties: [String: Any]) async {
         await initialization?.value
+        await MainActor.run { automaticProperties.screenName = name }
         guard await capturePolicy.screens else { return }
-        var values = json(properties)
+        guard !(await state.isOptedOut) else { return }
+        var values: JSONObject = [:]
+        let extras = await MainActor.run {
+            var result = automaticProperties.properties(event: "$screen")
+            if let scheme = dependencies.colorScheme(), ["dark", "light"].contains(scheme) {
+                result["$prefers_color_scheme"] = .string(scheme)
+            }
+            return result
+        }
+        values.merge(extras) { _, extra in extra }
+        values.merge(json(properties)) { _, explicit in explicit }
         values["$screen_name"] = .string(name)
         values["$screen_id"] = .string(dependencies.uuid.uuid())
         await captureCore("$screen", properties: values)
     }
+
+    #if canImport(UIKit)
+    @MainActor
+    func captureInteraction(_ name: String, element: NSObject, properties: [String: Any]) {
+        let automatic = json(properties)
+        let declarative = founderHQDeclarativeProperties(
+            element as? UIView ?? (element as? UIBarButtonItem)?.customView
+        )
+        _ = enqueueInvocation { [weak self] in
+            guard let self else { return }
+            await initialization?.value
+            guard !(await state.isOptedOut), elementCaptureEnabled,
+                  name != "$rageclick" || rageClickCaptureEnabled else { return }
+            let extras = await MainActor.run {
+                let description: JSONObject?
+                if case .array(let elements) = automatic["$elements"],
+                   case .object(let first) = elements.first { description = first }
+                else { description = nil }
+                return self.automaticProperties.properties(
+                    event: name, element: element, description: description,
+                    declarative: declarative
+                )
+            }
+            await captureCore(name, properties: automatic.merging(extras) { _, extra in extra })
+        }
+    }
+    #endif
 
     public func register(_ properties: [String: Any]) {
         _ = enqueueInvocation { [weak self] in
@@ -1357,7 +1410,8 @@ public final class FounderHQEvents: @unchecked Sendable {
 
     private func armAutomaticCapture() async {
         if await capturePolicy.lifecycle { startLifecycleCapture() }
-        if await capturePolicy.screens { await installScreenCaptureIfNeeded() }
+        // Track navigation even while screen event emission is disabled.
+        await installScreenCaptureIfNeeded()
         await installInteractionCaptureIfNeeded()
         installTracingHeadersIfNeeded()
     }
@@ -1536,6 +1590,7 @@ private actor EventsState {
     private let maxRetries: Int
     private let retryLadder: [TimeInterval?]
     private let debug: Bool
+    private let beforeSend: FounderHQBeforeSend?
     private var value: PersistedState
     let wasRestored: Bool
     let needsSessionStart: Bool
@@ -1551,7 +1606,8 @@ private actor EventsState {
         eventTTL: TimeInterval,
         maxRetries: Int,
         retryLadder: [TimeInterval?],
-        debug: Bool
+        debug: Bool,
+        beforeSend: FounderHQBeforeSend?
     ) {
         self.key = key
         self.storage = storage
@@ -1565,6 +1621,7 @@ private actor EventsState {
         self.maxRetries = max(0, maxRetries)
         self.retryLadder = retryLadder
         self.debug = debug
+        self.beforeSend = beforeSend
         if let data = storage.data(forKey: key),
            let restored = try? JSONDecoder().decode(PersistedState.self, from: data) {
             if isUUIDv7(restored.sessionId) {
@@ -1769,16 +1826,54 @@ private actor EventsState {
     }
 
     func enqueue(_ event: EventPayload) {
+        guard let event = eventForQueue(event) else { return }
         value.queue.append(event)
         pruneQueue()
         persist()
     }
     func enqueueInBackground(_ event: EventPayload) {
+        guard let event = eventForQueue(event) else { return }
         value.queue.append(event)
         pruneQueue()
         guard let data = try? JSONEncoder().encode(value) else { return }
         writer.persistInBackground(data)
     }
+    /// SDK-built events and purchase controls bypass hook validation.
+    private func eventForQueue(_ event: EventPayload) -> EventPayload? {
+        guard let beforeSend,
+              event.event != "$mobile_purchase_prepared",
+              event.event != "$mobile_purchase_claim" else { return event }
+        do {
+            guard let result = try beforeSend(event) else { return nil }
+            let name = result.event.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, name == event.event || isAllowedEvent(name),
+                  let distinctId = normalizeDistinctId(result.distinctId),
+                  isEventUUID(result.uuid),
+                  let instant = parseEventTimestamp(result.timestamp),
+                  (try? JSONEncoder().encode(result.properties)) != nil else { return nil }
+            // Ingest takes UTC timestamps only: an offset one is the same
+            // instant, rewritten rather than lost there. A UTC one keeps its
+            // own precision.
+            let timestamp = result.timestamp.hasSuffix("Z") ? result.timestamp : isoString(instant)
+            // Ingest trims a window id and refuses the whole event for an
+            // empty one or one past 200 UTF-16 units; the id goes instead.
+            let windowId = result.windowId
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .flatMap { !$0.isEmpty && $0.utf16.count <= 200 ? $0 : nil }
+            // The typed envelope and options expose only known keys, a JSON
+            // object for properties, and a boolean for process_person_profile.
+            return EventPayload(
+                uuid: result.uuid, event: name, distinctId: distinctId,
+                timestamp: timestamp, properties: result.properties,
+                sessionId: result.sessionId.flatMap { isUUIDv7($0) ? $0 : nil },
+                windowId: windowId,
+                options: .init(processPersonProfile: result.options.processPersonProfile)
+            )
+        } catch {
+            return nil
+        }
+    }
+
     func purchasePreparationIdentity() -> CaptureIdentity {
         let token = value.purchaseAttributionToken ?? value.anonymousId
         value.purchaseAttributionToken = token
@@ -1920,18 +2015,17 @@ private actor EventsState {
         var properties = event.properties
         properties["$anon_distinct_id"] = .string(anonymousId)
         properties["$device_id"] = .string(anonymousId)
-        value.queue.insert(
-            EventPayload(
-                uuid: uuid.uuid(),
-                event: event.event,
-                distinctId: event.distinctId,
-                timestamp: isoString(clock.now()),
-                properties: properties,
-                sessionId: event.sessionId,
-                options: event.options
-            ),
-            at: 0
+        let retry = EventPayload(
+            uuid: uuid.uuid(),
+            event: event.event,
+            distinctId: event.distinctId,
+            timestamp: isoString(clock.now()),
+            properties: properties,
+            sessionId: event.sessionId,
+            windowId: event.windowId,
+            options: event.options
         )
+        if let retry = eventForQueue(retry) { value.queue.insert(retry, at: 0) }
         persist()
     }
 
@@ -2168,28 +2262,61 @@ public struct FounderHQDefaultScreenCaptureInstaller: FounderHQScreenCaptureInst
     public init() {}
     public func install(client: FounderHQEvents) {
         #if canImport(UIKit)
-        FounderHQScreenCapture.install(client: client)
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { FounderHQScreenCapture.install(client: client) }
+        } else {
+            DispatchQueue.main.async { FounderHQScreenCapture.install(client: client) }
+        }
         #endif
     }
 }
 
-private struct EventPayload: Codable, Sendable {
-    let uuid: String
-    let event: String
-    let distinctId: String
-    let timestamp: String
-    var properties: JSONObject
-    let sessionId: String
-    let options: EventOptions
+private typealias EventPayload = FounderHQEvent
+
+public struct FounderHQEvent: Codable, Sendable {
+    public var uuid: String
+    public var event: String
+    public var distinctId: String
+    public var timestamp: String
+    public var properties: JSONObject
+    public var sessionId: String?
+    public var windowId: String? = nil
+    public var options: FounderHQEventOptions
     enum CodingKeys: String, CodingKey {
         case uuid, event, timestamp, properties, options
         case distinctId = "distinct_id"
         case sessionId = "session_id"
+        case windowId = "window_id"
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        uuid = try values.decode(String.self, forKey: .uuid)
+        event = try values.decode(String.self, forKey: .event)
+        distinctId = try values.decode(String.self, forKey: .distinctId)
+        timestamp = try values.decode(String.self, forKey: .timestamp)
+        properties = try values.decode(JSONObject.self, forKey: .properties)
+        sessionId = try? values.decode(String.self, forKey: .sessionId)
+        windowId = try? values.decode(String.self, forKey: .windowId)
+        options = try values.decode(FounderHQEventOptions.self, forKey: .options)
+    }
+
+    init(uuid: String, event: String, distinctId: String, timestamp: String,
+         properties: JSONObject, sessionId: String?, windowId: String? = nil,
+         options: FounderHQEventOptions) {
+        self.uuid = uuid
+        self.event = event
+        self.distinctId = distinctId
+        self.timestamp = timestamp
+        self.properties = properties
+        self.sessionId = sessionId
+        self.windowId = windowId
+        self.options = options
     }
 }
 
-private struct EventOptions: Codable, Sendable {
-    let processPersonProfile: Bool
+public struct FounderHQEventOptions: Codable, Sendable {
+    public var processPersonProfile: Bool
     enum CodingKeys: String, CodingKey {
         case processPersonProfile = "process_person_profile"
     }
@@ -2513,7 +2640,7 @@ private let campaignKeys: Set<String> = Set(
 
 private func isUUIDv7(_ value: String) -> Bool {
     let text = value.lowercased()
-    guard text.count == 36,
+    guard isEventUUID(value), text.count == 36,
           text[text.index(text.startIndex, offsetBy: 8)] == "-",
           text[text.index(text.startIndex, offsetBy: 13)] == "-",
           text[text.index(text.startIndex, offsetBy: 18)] == "-",
@@ -2539,7 +2666,7 @@ private func normalizeAccountKey(_ value: String) -> String? {
     return key
 }
 
-private func json(_ input: [String: Any]) -> JSONObject { input.mapValues(jsonValue) }
+func json(_ input: [String: Any]) -> JSONObject { input.mapValues(jsonValue) }
 private func jsonValue(_ value: Any) -> JSONValue {
     switch value {
     case let value as JSONValue: return value
@@ -2574,7 +2701,7 @@ private func isoString(_ date: Date) -> String { ISO8601DateFormatter.fhq.string
 
 private func normalizeDistinctId(_ value: String) -> String? {
     let distinctId = value.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard distinctId.count <= 400,
+    guard !distinctId.isEmpty, distinctId.count <= 400,
           !FounderHQProtocolConstants.illegalDistinctIds.contains(distinctId.lowercased())
     else { return nil }
     return distinctId
@@ -2595,7 +2722,7 @@ private func pruneEventQueue(
 ) -> [EventPayload] {
     let cutoff = now.addingTimeInterval(-max(0, eventTTL))
     return Array(queue.filter {
-        guard let createdAt = ISO8601DateFormatter.fhq.date(from: $0.timestamp) else {
+        guard let createdAt = parseEventTimestamp($0.timestamp) else {
             return false
         }
         return createdAt >= cutoff

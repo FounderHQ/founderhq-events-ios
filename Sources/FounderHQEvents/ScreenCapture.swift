@@ -2,6 +2,7 @@
 import UIKit
 import ObjectiveC.runtime
 
+@MainActor
 enum FounderHQScreenCapture {
     private static weak var client: FounderHQEvents?
     private static var installed = false
@@ -15,7 +16,12 @@ enum FounderHQScreenCapture {
         method_exchangeImplementations(original, replacement)
     }
 
+    /// The view of the controller that appeared last, for its appearance.
+    /// Weak: the SDK never keeps a screen alive.
+    private(set) static weak var lastAppearedView: UIView?
+
     static func appeared(_ controller: UIViewController) {
+        lastAppearedView = controller.viewIfLoaded
         let name = controller.title ?? String(describing: type(of: controller))
         client?.screen(name)
     }

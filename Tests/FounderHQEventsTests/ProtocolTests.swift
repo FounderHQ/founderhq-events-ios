@@ -703,7 +703,10 @@ final class ProtocolTests: XCTestCase {
             uuid: uuids,
             storage: storage,
             transport: transport,
-            platformFacts: TestFacts(values: testJSON(facts))
+            platformFacts: TestFacts(values: testJSON(facts)),
+            // The shared fixtures say nothing of the system appearance; a
+            // simulator has one, and the golden output must not depend on it.
+            colorScheme: { nil }
         )
         var client: FounderHQEvents?
         var apiKey = "fhq_pk_fixture"

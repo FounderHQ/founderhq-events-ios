@@ -28,6 +28,7 @@ import ObjectiveC.runtime
  Text fields, text views, and search bars are skipped whole, so a keystroke,
  a value, or a placeholder never reaches the queue.
  */
+@MainActor
 enum FounderHQInteractionCapture {
     /// A rage tap is three taps on one element inside this many seconds.
     private static let rageWindow =
@@ -58,6 +59,11 @@ enum FounderHQInteractionCapture {
     private static var lastReportedTouchToken: TimeInterval?
 
     static func install(client: FounderHQEvents, debug: Bool) {
+        if self.client !== client {
+            recentTaps = []
+            lastRageTapAt = 0
+            lastReportedTouchToken = nil
+        }
         self.client = client
         self.debug = debug
         guard !installed else { return }
@@ -152,7 +158,7 @@ enum FounderHQInteractionCapture {
         guard !isTextInput(element), claimTouch() else { return }
         guard let properties = properties(for: element, action: action, gesture: gesture)
         else { return }
-        client.capture("$autocapture", properties: properties)
+        client.captureInteraction("$autocapture", element: element, properties: properties)
         detectRageTap(element, properties: properties, client: client)
     }
 
@@ -296,7 +302,7 @@ enum FounderHQInteractionCapture {
               now - lastRageTapAt > rageWindow
         else { return }
         lastRageTapAt = now
-        client.capture("$rageclick", properties: properties)
+        client.captureInteraction("$rageclick", element: sender, properties: properties)
     }
 
     private final class RecentTap {
@@ -311,7 +317,9 @@ enum FounderHQInteractionCapture {
     private static func owningViewController(_ sender: NSObject) -> UIViewController? {
         var responder = (sender as? UIResponder)?.next
         while let current = responder {
-            if let controller = current as? UIViewController { return controller }
+            if let controller = current as? UIViewController {
+                return controller
+            }
             responder = current.next
         }
         return nil
