@@ -6,18 +6,18 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 
 `https://github.com/FounderHQ/founderhq-events-ios`
 
-Select version **1.1.0** or later. Swift Package Manager is the recommended installation method.
+Select version **1.1.1** or later. Swift Package Manager is the recommended installation method.
 
 For CocoaPods:
 
 ```ruby
-pod 'FounderHQEvents', '~> 1.1.0'
+pod 'FounderHQEvents', '~> 1.1.1'
 ```
 
 For installation directly from the release tag:
 
 ```ruby
-pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.1.0'
+pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.1.1'
 ```
 
 Both installation methods use the same Swift implementation. Requires iOS 15 or later.
@@ -29,7 +29,7 @@ application lifecycle and UIKit screen capture, a SwiftUI `founderHQScreen`
 modifier, durable identity/queue/consent, and the same capture/profile API as
 the web SDK. Advertising identifiers are never collected.
 
-Version 1.1.0 sends PostHog-aligned protocol v2 requests to `POST /i/v2/e`, emits
+Version 1.1.1 sends protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 and reports screen/viewport dimensions in physical pixels. Automatic facts use
 the canonical `$` taxonomy and deep links recognize all 24 campaign keys.
@@ -128,7 +128,7 @@ action selector or recogniser class, the class names of the views above it,
 and the owning view controller. It never records tap coordinates.
 
 It also records the title the tapped control renders, as `text`, for the three
-kinds of control that publish a static one. This matches posthog-ios.
+kinds of control that publish a static one.
 
 | Control | What `text` holds |
 | --- | --- |
@@ -350,6 +350,11 @@ installs it on the simulator, taps a real control, and prints one line per
 check.
 
 ## Release notes
+
+### 1.1.1
+
+- Documentation only; no change in behavior. The pod version and the SDK
+  version sent on the wire are both `1.1.1`.
 
 ### 1.1.0
 
