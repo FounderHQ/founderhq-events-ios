@@ -6,6 +6,9 @@ import UIKit
 #if canImport(StoreKit)
 import StoreKit
 #endif
+#if canImport(UserNotifications)
+import UserNotifications
+#endif
 
 public enum FounderHQPersonProfiles: String, Codable, Sendable {
     case always
@@ -226,10 +229,20 @@ public struct FounderHQEventsConfiguration: Sendable {
     /**
      Emits `$push_notification_opened` when the user taps a notification. On
      by default because the tap is the moment the app comes back, and the SDK
-     only reads the action, category, and request identifiers — never the
-     title, body, payload, or anything the user typed in reply.
+     only reads the action, category, and request identifiers, plus the two
+     FounderHQ keys of the payload (`fhqOutboundMessageId` and `fhqLink`) —
+     never the title, body, the rest of the payload, or anything the user
+     typed in reply.
      */
     public var capturePushNotificationOpened: Bool
+    /**
+     Called on the main actor when the user opens a notification, with its
+     FounderHQ message id and link. Open the link here; the SDK never does.
+     It runs for the opens the SDK reports by itself. With
+     `capturePushNotificationOpened` off, it runs for the opens your app
+     reports with `capturePushNotificationOpened(userInfo:)`.
+     */
+    public var onPushNotificationOpened: FounderHQPushOpenedHandler?
     /**
      Prints what the SDK drops, refuses, or fails to install. Off by default
      so a shipping app stays quiet; turn it on while you wire the SDK up.
@@ -238,7 +251,7 @@ public struct FounderHQEventsConfiguration: Sendable {
     /// Enriches screens and taps without changing which events are captured.
     public var autoProperties: FounderHQAutoProperties?
     /// Runs on the state actor before queueing, including identity retries.
-    /// Purchase control events bypass this hook. Returning nil or throwing drops other events.
+    /// Purchase and push device control events bypass this hook. Returning nil or throwing drops other events.
     public var beforeSend: FounderHQBeforeSend?
     public init(
         host: URL = URL(string: "https://i.getfounderhq.com")!,
@@ -261,7 +274,8 @@ public struct FounderHQEventsConfiguration: Sendable {
         capturePushNotificationOpened: Bool = true,
         debug: Bool = false,
         autoProperties: FounderHQAutoProperties? = nil,
-        beforeSend: FounderHQBeforeSend? = nil
+        beforeSend: FounderHQBeforeSend? = nil,
+        onPushNotificationOpened: FounderHQPushOpenedHandler? = nil
     ) {
         self.host = host
         self.flushAt = flushAt
@@ -284,12 +298,13 @@ public struct FounderHQEventsConfiguration: Sendable {
         self.debug = debug
         self.autoProperties = autoProperties
         self.beforeSend = beforeSend
+        self.onPushNotificationOpened = onPushNotificationOpened
     }
 }
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "1.1.1"
+    public static let sdkVersion = "1.2.0"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration
@@ -303,11 +318,11 @@ public final class FounderHQEvents: @unchecked Sendable {
     private var timer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var initialization: Task<Void, Never>?
+    private var startPushRegistration: Task<Void, Never>?
     private let invocationLock = NSLock()
     private var invocationTail: Task<Void, Never>?
     private var screenCaptureInstalled = false
     private var elementCaptureInstalled = false
-    private var pushCaptureInstalled = false
     private var tracingHeadersInstalled = false
     private let sessionSnapshot = FounderHQSessionSnapshot()
     private let interactionSnapshot = FounderHQInteractionCaptureSnapshot()
@@ -355,8 +370,15 @@ public final class FounderHQEvents: @unchecked Sendable {
             beforeSend: configuration.beforeSend
         )
         startTimer()
-        initialization = Task { [weak self] in
-            guard let self else { return }
+        // Before the start task, not inside it: iOS reports the tap that
+        // started the app right after `didFinishLaunching`, and the start
+        // task can wait for remote config first.
+        installPushCapture()
+        let start = Task<Bool, Never> { [weak self] in
+            guard let self else { return false }
+            // Before anything else this start queues: a removal that never
+            // reached the server goes out first.
+            await requeuePendingPushRemovals()
             if let account = configuration.account {
                 await setAccountCore(account, emit: true)
             }
@@ -379,6 +401,17 @@ public final class FounderHQEvents: @unchecked Sendable {
                 await captureCore("$session_start", properties: [:])
             }
             if configuration.captureInstallUpdates { await captureInstallOrUpdate() }
+            // Decided here, before any call of the app can run.
+            return await hasPushDeviceToRegister()
+        }
+        initialization = Task { _ = await start.value }
+        // Every start registers the stored token again for an identified
+        // person: it is what keeps "the last used device" true on the server.
+        // It reads the notification permission from the system, so it runs
+        // after the start task: no other call waits for that read.
+        startPushRegistration = Task { [weak self] in
+            guard await start.value else { return }
+            await self?.registerStoredPushDeviceAtStart()
         }
     }
 
@@ -401,6 +434,7 @@ public final class FounderHQEvents: @unchecked Sendable {
 
     public func readyForCapture() async {
         await initialization?.value
+        await startPushRegistration?.value
         await invocationSnapshot()?.value
     }
 
@@ -434,6 +468,8 @@ public final class FounderHQEvents: @unchecked Sendable {
             NSLog("[FounderHQEvents] identify ignored an invalid distinct ID")
             return
         }
+        let previousDistinctId = await state.distinctId
+        let wasIdentified = await state.isIdentified
         let transition = await state.identify(
             distinctId,
             properties: json(properties),
@@ -453,6 +489,13 @@ public final class FounderHQEvents: @unchecked Sendable {
             identifyProperties["$group_set"] = .object(groupSet)
         }
         await captureCore("$identify", properties: identifyProperties)
+        // After `$identify`, so the server already knows who this person is. A
+        // registration for another person moves the device to them. The same
+        // person again changes nothing, so nothing is sent.
+        let currentDistinctId = await state.distinctId
+        if !wasIdentified || previousDistinctId != currentDistinctId {
+            await registerStoredPushDevice()
+        }
     }
 
     public func setAccount(
@@ -662,6 +705,10 @@ public final class FounderHQEvents: @unchecked Sendable {
     }
     private func resetOperation() async {
         await initialization?.value
+        // The removal is built before the identity rotates, so it carries the
+        // distinct ID of the person who signs out. It is the one event a reset
+        // keeps: the rest of the queue goes, as before.
+        let removed = await removePushDeviceFromCurrentPerson()
         let transition = await state.reset()
         await refreshSessionSnapshot()
         if transition.enabled {
@@ -670,6 +717,179 @@ public final class FounderHQEvents: @unchecked Sendable {
                 "$purchase_attribution_token": .string(transition.token),
             ])
         }
+        if removed { flushPushDeviceRemoval() }
+    }
+
+    /**
+     Stores this device's push token: the `Data` from
+     `application(_:didRegisterForRemoteNotificationsWithDeviceToken:)`. It is
+     always an APNs token, whatever provider the options name.
+
+     The device is registered only for an identified person: the SDK sends the
+     registration after `identify` and until `reset()`, and sends nothing for
+     a guest. While a person is identified it sends the registration again on
+     every app start, on a new token, and after `setPushEnabled`.
+
+     The SDK never asks for the notification permission; it only reads the
+     state the system reports. Leave `environment` out and the SDK reads it
+     from the build's provisioning profile.
+     */
+    public func registerPushToken(
+        _ deviceToken: Data,
+        options: FounderHQPushRegistrationOptions = .apns()
+    ) {
+        registerPushToken(founderHQPushTokenHex(deviceToken), options: Self.apns(options))
+    }
+
+    public func registerPushTokenAndWait(
+        _ deviceToken: Data,
+        options: FounderHQPushRegistrationOptions = .apns()
+    ) async {
+        await registerPushTokenAndWait(
+            founderHQPushTokenHex(deviceToken), options: Self.apns(options)
+        )
+    }
+
+    private static func apns(
+        _ options: FounderHQPushRegistrationOptions
+    ) -> FounderHQPushRegistrationOptions {
+        var options = options
+        options.provider = .apns
+        return options
+    }
+
+    /**
+     Stores a token given as text: Firebase (`.fcm()`), Expo (`.expo()`), or an
+     APNs token already in hex (`.apns()`). A token the server would refuse is
+     not stored and not sent, and the SDK logs the reason (never the token).
+     */
+    public func registerPushToken(_ token: String, options: FounderHQPushRegistrationOptions) {
+        _ = enqueueInvocation { [weak self] in
+            await self?.registerPushTokenOperation(token, options: options)
+        }
+    }
+
+    public func registerPushTokenAndWait(
+        _ token: String,
+        options: FounderHQPushRegistrationOptions
+    ) async {
+        await enqueueInvocation { [weak self] in
+            await self?.registerPushTokenOperation(token, options: options)
+        }.value
+    }
+
+    private func registerPushTokenOperation(
+        _ token: String,
+        options: FounderHQPushRegistrationOptions
+    ) async {
+        await initialization?.value
+        let provider = options.provider
+        let normalized: String
+        switch founderHQNormalizedPushToken(token, provider: provider) {
+        case .valid(let value):
+            normalized = value
+        case .invalid(let reason):
+            // The token is never logged, valid or not.
+            NSLog("[FounderHQEvents] registerPushToken ignored the token: %@", reason)
+            return
+        }
+        let previous = await state.pushDevice
+        if previous?.token != normalized || previous?.provider != provider {
+            // A refreshed token replaces the old one instead of leaving it behind.
+            _ = await removePushDeviceFromCurrentPerson()
+        }
+        await state.storePushToken(
+            normalized,
+            provider: provider,
+            appId: options.appId?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty,
+            environment: options.environment
+                ?? (provider == .apns ? FounderHQPushEnvironmentDetector.detect() : nil),
+            enabled: options.enabled
+        )
+        if let permission = options.permission {
+            await registerStoredPushDevice(permission: .known(permission))
+        } else {
+            await registerStoredPushDevice()
+        }
+    }
+
+    /**
+     The app's own push switch for this device. `false` stops every push to
+     it; the token stays registered. The SDK always stores the switch and
+     sends it only while a person is identified; otherwise it travels with the
+     next registration. `reset()` clears it.
+     */
+    public func setPushEnabled(_ enabled: Bool) {
+        _ = enqueueInvocation { [weak self] in await self?.setPushEnabledOperation(enabled) }
+    }
+    public func setPushEnabledAndWait(_ enabled: Bool) async {
+        await enqueueInvocation { [weak self] in await self?.setPushEnabledOperation(enabled) }.value
+    }
+    private func setPushEnabledOperation(_ enabled: Bool) async {
+        await initialization?.value
+        await state.setPushEnabled(enabled)
+        await registerStoredPushDevice()
+    }
+
+    /// Removes this device from the current person and forgets the token.
+    public func unregisterPushToken() {
+        _ = enqueueInvocation { [weak self] in await self?.unregisterPushTokenOperation() }
+    }
+    public func unregisterPushTokenAndWait() async {
+        await enqueueInvocation { [weak self] in await self?.unregisterPushTokenOperation() }.value
+    }
+    private func unregisterPushTokenOperation() async {
+        await initialization?.value
+        let removed = await removePushDeviceFromCurrentPerson()
+        await state.forgetPushToken()
+        if removed { flushPushDeviceRemoval() }
+    }
+
+    /**
+     Reports that the user opened the app from a notification, and returns the
+     notification's link (`fhqLink`) or nil. Call it only if you turned
+     `capturePushNotificationOpened` off. While that is on, the SDK reports
+     the open by itself, and this method reports nothing: it only returns the
+     link.
+
+     Only `fhqOutboundMessageId` and `fhqLink` are read from `userInfo`. A
+     payload with neither is not a FounderHQ notification: the SDK reports
+     nothing for it and returns nil, so you can pass every notification.
+     */
+    @discardableResult
+    public func capturePushNotificationOpened(
+        userInfo: [AnyHashable: Any],
+        properties: [String: Any] = [:]
+    ) -> String? {
+        let payload = FounderHQPushPayload(userInfo: userInfo)
+        guard payload.isFounderHQ else { return nil }
+        guard !configuration.capturePushNotificationOpened else {
+            founderHQDebugLog(configuration.debug) {
+                "capturePushNotificationOpened(userInfo:) reported nothing: the SDK reports opens by itself"
+            }
+            return payload.link
+        }
+        return pushNotificationOpened(payload, properties: properties)
+    }
+
+    @discardableResult
+    func pushNotificationOpened(
+        _ payload: FounderHQPushPayload,
+        properties: [String: Any]
+    ) -> String? {
+        var properties = properties
+        if let messageId = payload.messageId {
+            properties[FounderHQProtocolConstants.PushProperty.messageId] = messageId
+        }
+        capture(FounderHQProtocolConstants.pushNotificationOpenedEvent, properties: properties)
+        if let handler = configuration.onPushNotificationOpened {
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { handler(payload) }
+            } else {
+                DispatchQueue.main.async { MainActor.assumeIsolated { handler(payload) } }
+            }
+        }
+        return payload.link
     }
     public func optIn() {
         _ = enqueueInvocation { [weak self] in await self?.setOptedOutOperation(false) }
@@ -687,6 +907,8 @@ public final class FounderHQEvents: @unchecked Sendable {
         await initialization?.value
         await state.setOptedOut(optedOut)
         await refreshSessionSnapshot()
+        // Registrations were held back while the person was opted out.
+        if !optedOut { await registerStoredPushDevice() }
     }
     public func isOptedOut() async -> Bool { await state.isOptedOut }
     public func getDistinctId() async -> String { await state.distinctId }
@@ -1146,6 +1368,7 @@ public final class FounderHQEvents: @unchecked Sendable {
     @discardableResult
     public func flush() async -> Bool {
         await initialization?.value
+        await startPushRegistration?.value
         await invocationSnapshot()?.value
         return await flushCore(respectRetryLadder: false)
     }
@@ -1264,48 +1487,13 @@ public final class FounderHQEvents: @unchecked Sendable {
         }
         let identity = captureIdentity.identity
         sessionSnapshot.set(identity.sessionId)
-        var automatic = dependencies.platformFacts.properties()
-        automatic["$platform"] = .string("ios")
-        automatic["$device_id"] = .string(identity.anonymousId)
-        if identity.purchaseAttributionEnabled {
-            automatic["$purchase_attribution_token"] = .string(identity.purchaseAttributionToken)
-        }
-        if let account = identity.account {
-            automatic["$groups"] = .object(["account": .string(account.key)])
-            automatic["$account_span_id"] = .string(account.spanId)
-            if let contextToken = account.contextToken {
-                automatic["$account_context_token"] = .string(contextToken)
-            }
-        }
-        let registered = await state.registered
-        var merged = automatic
-            .merging(registered) { _, registered in registered }
-            .merging(properties) { _, explicit in explicit }
-        if let account = identity.account {
-            merged["$groups"] = .object(["account": .string(account.key)])
-            merged["$account_span_id"] = .string(account.spanId)
-            if let contextToken = account.contextToken {
-                merged["$account_context_token"] = .string(contextToken)
-            } else {
-                merged.removeValue(forKey: "$account_context_token")
-            }
-        }
-        for key in ["$lib", "$lib_version", "$session_id", "$window_id"] {
-            merged.removeValue(forKey: key)
-        }
-        let event = EventPayload(
-            uuid: dependencies.uuid.uuid(),
-            event: name,
-            distinctId: identity.distinctId,
-            timestamp: isoString(dependencies.clock.now()),
-            properties: merged,
-            sessionId: identity.sessionId,
-            options: .init(
-                processPersonProfile: shouldProcessPersonProfile(
-                    configuration.personProfiles,
-                    identified: identity.identified
-                )
-            )
+        let event = envelope(
+            name,
+            identity: identity,
+            properties: properties,
+            registered: await state.registered,
+            attributionToken: identity.purchaseAttributionEnabled,
+            account: .current
         )
         await state.enqueue(event)
         if await state.queueCount >= configuration.flushAt {
@@ -1320,33 +1508,255 @@ public final class FounderHQEvents: @unchecked Sendable {
     ) async {
         guard !(await state.isOptedOut) else { return }
         let identity = (await state.identityForCapture()).identity
+        await state.enqueue(envelope(
+            name,
+            identity: identity,
+            properties: properties,
+            attributionToken: true,
+            account: .snapshot(accountProperties)
+        ))
+    }
+
+    /// Which account facts an envelope carries.
+    private enum EnvelopeAccount {
+        /// None: a push device event.
+        case none
+        /// The account in place now. It wins over every other property.
+        case current
+        /// The account as it was when a purchase was prepared.
+        case snapshot(JSONObject)
+    }
+
+    /**
+     The one place an event envelope is built. Ordinary events, purchase
+     control events, and push device events differ only in the arguments. It
+     reads the identity it is given and never rotates a session: the caller
+     decides whether this event is activity.
+     */
+    private func envelope(
+        _ name: String,
+        identity: CaptureIdentity,
+        properties: JSONObject,
+        registered: JSONObject = [:],
+        attributionToken: Bool,
+        account: EnvelopeAccount,
+        uuid: String? = nil,
+        timestamp: String? = nil,
+        person: (distinctId: String, identified: Bool)? = nil
+    ) -> EventPayload {
         var automatic = dependencies.platformFacts.properties()
         automatic["$platform"] = .string("ios")
         automatic["$device_id"] = .string(identity.anonymousId)
-        automatic["$purchase_attribution_token"] = .string(
-            identity.purchaseAttributionToken
-        )
+        if attributionToken {
+            automatic["$purchase_attribution_token"] = .string(identity.purchaseAttributionToken)
+        }
+        var accountProperties: JSONObject = [:]
+        var dropsContextToken = false
+        switch account {
+        case .none:
+            break
+        case .current:
+            if let account = identity.account {
+                accountProperties["$groups"] = .object(["account": .string(account.key)])
+                accountProperties["$account_span_id"] = .string(account.spanId)
+                if let contextToken = account.contextToken {
+                    accountProperties["$account_context_token"] = .string(contextToken)
+                } else {
+                    dropsContextToken = true
+                }
+            }
+        case .snapshot(let snapshot):
+            accountProperties = snapshot
+        }
         var merged = automatic
+            .merging(registered) { _, registered in registered }
             .merging(properties) { _, explicit in explicit }
-            .merging(accountProperties) { _, snapshot in snapshot }
+            .merging(accountProperties) { _, account in account }
+        if dropsContextToken { merged.removeValue(forKey: "$account_context_token") }
         for key in ["$lib", "$lib_version", "$session_id", "$window_id"] {
             merged.removeValue(forKey: key)
         }
-        let event = EventPayload(
-            uuid: dependencies.uuid.uuid(),
+        return EventPayload(
+            uuid: uuid ?? dependencies.uuid.uuid(),
             event: name,
-            distinctId: identity.distinctId,
-            timestamp: isoString(dependencies.clock.now()),
+            distinctId: person?.distinctId ?? identity.distinctId,
+            timestamp: timestamp ?? isoString(dependencies.clock.now()),
             properties: merged,
             sessionId: identity.sessionId,
             options: .init(
                 processPersonProfile: shouldProcessPersonProfile(
                     configuration.personProfiles,
-                    identified: identity.identified
+                    identified: person?.identified ?? identity.identified
                 )
             )
         )
-        await state.enqueue(event)
+    }
+
+    /// Where a registration gets the notification permission from.
+    private enum PushPermissionSource {
+        /// Ask the system now.
+        case system
+        /// The app gave it, or the caller already asked the system.
+        case known(FounderHQPushPermission?)
+    }
+
+    /**
+     Sends the stored token for the current person, and only for an identified
+     one: a guest gets no device. A registration moves "last seen" on the
+     server, so each start sends one. A registration that is the same as the
+     last one this process queued is not sent again.
+
+     It runs only on the invocation chain, so nothing changes the person or
+     the token between its steps.
+     */
+    private func registerStoredPushDevice(permission: PushPermissionSource = .system) async {
+        guard let device = await state.pushDevice,
+              let token = device.token, let provider = device.provider,
+              await state.isIdentified else { return }
+        // The app registers this device for this person now. A removal of the
+        // same device from the same person that still waits is out of date:
+        // sent later, it would take the device away again. Before the opt-out
+        // check, because an opted-out person sends no registration to undo it.
+        await state.dropPushRemovals(token: token, provider: provider)
+        guard !(await state.isOptedOut) else { return }
+        typealias Key = FounderHQProtocolConstants.PushProperty
+        var properties: JSONObject = [
+            Key.token: .string(token),
+            Key.provider: .string(provider.rawValue),
+            Key.platform: .string(Self.pushPlatform),
+        ]
+        if let appId = device.appId { properties[Key.appId] = .string(appId) }
+        if let environment = device.environment {
+            properties[Key.environment] = .string(environment.rawValue)
+        }
+        if let enabled = device.enabled { properties[Key.enabled] = .bool(enabled) }
+        let seen: FounderHQPushPermission?
+        switch permission {
+        case .system: seen = await systemPushPermission()
+        case .known(let value): seen = value
+        }
+        if let seen { properties[Key.permission] = .string(seen.rawValue) }
+        await state.enqueuePushRegistration(pushControlEvent(
+            FounderHQProtocolConstants.pushDeviceRegisteredEvent,
+            identity: await state.identitySnapshot(),
+            properties: properties
+        ), registration: properties)
+    }
+
+    /**
+     The registration of a start. The permission is read first, outside the
+     invocation chain, so a slow answer from the system delays no other call.
+     The registration itself then takes its turn on the chain.
+     */
+    private func registerStoredPushDeviceAtStart() async {
+        let permission = await systemPushPermission()
+        await enqueueInvocation { [weak self] in
+            await self?.registerStoredPushDevice(permission: .known(permission))
+        }.value
+    }
+
+    /// Whether a start has a registration to send: a token, for an identified person.
+    private func hasPushDeviceToRegister() async -> Bool {
+        guard let device = await state.pushDevice, device.token != nil, device.provider != nil
+        else { return false }
+        return await state.isIdentified
+    }
+
+    /// This SDK's own `$push_platform`.
+    static let pushPlatform = "ios"
+
+    /**
+     Takes the stored token away from the person in place now. Nothing was
+     registered for a guest, so there is nothing to remove for one. The
+     removal is sent even while opted out. Returns whether one was queued.
+     */
+    private func removePushDeviceFromCurrentPerson() async -> Bool {
+        // Written down first: the queue can lose an event (age, size,
+        // retries), the list of pending removals cannot.
+        guard let removal = await state.beginPushRemoval() else { return false }
+        await state.enqueue(pushRemovedEvent(removal, identity: await state.identitySnapshot()))
+        return true
+    }
+
+    private func pushRemovedEvent(
+        _ removal: FounderHQPendingPushRemoval,
+        identity: CaptureIdentity
+    ) -> EventPayload {
+        typealias Key = FounderHQProtocolConstants.PushProperty
+        var properties: JSONObject = [Key.token: .string(removal.token)]
+        if let provider = removal.provider {
+            properties[Key.provider] = .string(provider.rawValue)
+        }
+        return pushControlEvent(
+            FounderHQProtocolConstants.pushDeviceRemovedEvent,
+            identity: identity,
+            properties: properties,
+            uuid: removal.uuid,
+            // The time of the sign-out, on every send.
+            timestamp: removal.timestamp,
+            // A removal is only ever written for an identified person.
+            person: (removal.distinctId, true)
+        )
+    }
+
+    /**
+     On a start, every removal the server has not accepted goes to the front
+     of the queue again, before any registration. The queue copy of an older
+     attempt is replaced, so a removal is never in the queue twice. It keeps
+     the time of the sign-out, however late it goes.
+     */
+    private func requeuePendingPushRemovals() async {
+        let pending = await state.pendingPushRemovals
+        guard !pending.isEmpty else { return }
+        let identity = await state.identitySnapshot()
+        await state.requeuePushRemovals(pending.map { pushRemovedEvent($0, identity: identity) })
+    }
+
+    /// A logout is often the last thing an app does, so the removal goes now.
+    private func flushPushDeviceRemoval() {
+        Task { [weak self] in _ = await self?.flushCore(respectRetryLadder: true) }
+    }
+
+    /**
+     Push device events are instructions, not analytics: they skip `beforeSend`
+     and super properties, so the token reaches ingest exactly as given and no
+     hook sees it. The identity is read as it is: such an event never rotates
+     a session and never counts as activity. The caller decides about opt-out.
+     */
+    private func pushControlEvent(
+        _ name: String,
+        identity: CaptureIdentity,
+        properties: JSONObject,
+        uuid: String? = nil,
+        timestamp: String? = nil,
+        person: (distinctId: String, identified: Bool)? = nil
+    ) -> EventPayload {
+        envelope(
+            name,
+            identity: identity,
+            properties: properties,
+            attributionToken: false,
+            account: .none,
+            uuid: uuid,
+            timestamp: timestamp,
+            person: person
+        )
+    }
+
+    /**
+     The permission the system reports, read without a prompt. A process with
+     no app bundle behind it (a test runner, a command line tool) has no
+     notification centre to ask, and asking would raise.
+     */
+    private func systemPushPermission() async -> FounderHQPushPermission? {
+        #if canImport(UserNotifications)
+        let bundlePath = Bundle.main.bundlePath
+        guard bundlePath.hasSuffix(".app") || bundlePath.hasSuffix(".appex") else { return nil }
+        let settings = await UNUserNotificationCenter.current().notificationSettings()
+        return founderHQPushPermission(authorizationStatus: settings.authorizationStatus.rawValue)
+        #else
+        return nil
+        #endif
     }
 
     @discardableResult
@@ -1428,11 +1838,24 @@ public final class FounderHQEvents: @unchecked Sendable {
             }
         }
         #endif
+    }
+
+    /**
+     Hooks the notification centre delegate, on the main thread and without a
+     wait when the SDK is created there. Only the app's own configuration
+     decides this, so nothing has to load first: with
+     `capturePushNotificationOpened` off, nothing is hooked.
+     */
+    private func installPushCapture() {
         #if canImport(UIKit) && canImport(UserNotifications)
-        if configuration.capturePushNotificationOpened, !pushCaptureInstalled {
-            pushCaptureInstalled = true
-            await MainActor.run {
-                FounderHQPushCapture.install(client: self, debug: configuration.debug)
+        guard configuration.capturePushNotificationOpened else { return }
+        let debug = configuration.debug
+        if Thread.isMainThread {
+            FounderHQPushCapture.install(client: self, debug: debug)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                FounderHQPushCapture.install(client: self, debug: debug)
             }
         }
         #endif
@@ -1592,6 +2015,12 @@ private actor EventsState {
     private let debug: Bool
     private let beforeSend: FounderHQBeforeSend?
     private var value: PersistedState
+    /**
+     The last registration this process queued. Not stored: a new process
+     sends one again. Cleared when that registration can no longer reach the
+     server, or when the server may have lost the device since.
+     */
+    private var lastPushRegistration: PushRegistrationSignature?
     let wasRestored: Bool
     let needsSessionStart: Bool
 
@@ -1678,6 +2107,7 @@ private actor EventsState {
     }
 
     var isOptedOut: Bool { value.optedOut }
+    var isIdentified: Bool { value.identified }
     var distinctId: String { value.distinctId }
     func currentSessionId() -> String { value.sessionId }
     var registered: JSONObject { value.registered }
@@ -1689,6 +2119,13 @@ private actor EventsState {
         persist()
         return .init(identity: identity, rotated: rotated)
     }
+
+    /**
+     The identity as it is: no session rotates and nothing counts as activity.
+     Push device events read it this way, because they are instructions and
+     not something the person did.
+     */
+    func identitySnapshot() -> CaptureIdentity { identity }
 
     func sessionIdentity() -> SessionIdentityResult {
         let rotated = rotateSessionIfNeeded()
@@ -1720,6 +2157,12 @@ private actor EventsState {
             value.anonymousId = guestID
             value.purchaseAttributionToken = guestID
             value.account = nil
+            // The push switch belonged to the person before. The token stays.
+            if var push = value.push {
+                push.enabled = nil
+                value.push = push.isEmpty ? nil : push
+            }
+            lastPushRegistration = nil
         }
         let groupSet = account.flatMap(applyAccount)
         let transition = IdentityTransition(
@@ -1785,15 +2228,153 @@ private actor EventsState {
     func setOptedOut(_ optedOut: Bool) {
         value.optedOut = optedOut
         if optedOut {
-            value.queue = []
+            // A device removal still goes out: opting out of analytics must
+            // not leave a signed-out person's device registered.
+            value.queue = value.queue.filter(Self.isPushDeviceRemoval)
             value.deliveryAttempts = nil
+            pruneDeliverySchedule()
+            lastPushRegistration = nil
         }
         persist()
+    }
+
+    var pushDevice: FounderHQPushDeviceState? { value.push }
+    var pendingPushRemovals: [FounderHQPendingPushRemoval] { value.push?.pendingRemovals ?? [] }
+
+    private static func isPushDeviceRemoval(_ event: EventPayload) -> Bool {
+        event.event == FounderHQProtocolConstants.pushDeviceRemovedEvent
+    }
+
+    /// Stores the push state. An empty one is not kept.
+    private func setPushDevice(_ device: FounderHQPushDeviceState) {
+        var device = device
+        if device.pendingRemovals?.isEmpty == true { device.pendingRemovals = nil }
+        value.push = device.isEmpty ? nil : device
+        persist()
+    }
+
+    /// The token and what came with it. A nil `enabled` keeps the stored switch.
+    func storePushToken(
+        _ token: String,
+        provider: FounderHQPushProvider,
+        appId: String?,
+        environment: FounderHQPushEnvironment?,
+        enabled: Bool?
+    ) {
+        setPushDevice(.init(
+            token: token,
+            provider: provider,
+            appId: appId,
+            environment: environment,
+            enabled: enabled ?? value.push?.enabled,
+            pendingRemovals: value.push?.pendingRemovals
+        ))
+    }
+
+    func setPushEnabled(_ enabled: Bool) {
+        var device = value.push ?? .init()
+        device.enabled = enabled
+        setPushDevice(device)
+    }
+
+    /// Forgets the token and the switch. Removals not yet accepted are kept.
+    func forgetPushToken() {
+        lastPushRegistration = nil
+        setPushDevice(.init(pendingRemovals: value.push?.pendingRemovals))
+    }
+
+    /**
+     Writes down that the stored token leaves the person in place now, and
+     returns the removal to send. Nil for a guest (nothing was registered) or
+     when there is no token.
+     */
+    func beginPushRemoval() -> FounderHQPendingPushRemoval? {
+        guard value.identified, var device = value.push, let token = device.token
+        else { return nil }
+        let removal = FounderHQPendingPushRemoval(
+            uuid: uuid.uuid(), token: token, provider: device.provider,
+            distinctId: value.distinctId, timestamp: isoString(clock.now())
+        )
+        device.pendingRemovals = Array(
+            ((device.pendingRemovals ?? []) + [removal]).suffix(founderHQMaxPendingPushRemovals)
+        )
+        setPushDevice(device)
+        return removal
+    }
+
+    /// Puts the removals at the front of the queue, on a fresh retry ladder.
+    func requeuePushRemovals(_ events: [EventPayload]) {
+        value.queue = events + value.queue.filter { !Self.isPushDeviceRemoval($0) }
+        for event in events { value.deliverySchedule?.removeValue(forKey: event.uuid) }
+        pruneQueue()
+        persist()
+    }
+
+    /**
+     Forgets every waiting removal of this device from the person in place
+     now: the list entry and the queued copy. The app registers the device for
+     that person again, so the removal is out of date.
+     */
+    func dropPushRemovals(token: String, provider: FounderHQPushProvider) {
+        typealias Key = FounderHQProtocolConstants.PushProperty
+        let distinctId = value.distinctId
+        let before = value.queue.count
+        value.queue.removeAll { event in
+            guard Self.isPushDeviceRemoval(event), event.distinctId == distinctId,
+                  event.properties[Key.token] == .string(token) else { return false }
+            let named = event.properties[Key.provider]
+            return named == nil || named == .string(provider.rawValue)
+        }
+        let pending = value.push?.pendingRemovals ?? []
+        let kept = pending.filter {
+            !$0.matches(token: token, provider: provider, distinctId: distinctId)
+        }
+        guard kept.count < pending.count || value.queue.count < before else { return }
+        pruneDeliverySchedule()
+        if var device = value.push {
+            device.pendingRemovals = kept
+            setPushDevice(device)
+        } else {
+            persist()
+        }
+    }
+
+    /**
+     Queues a registration, unless it is the same as the last one this process
+     queued: same person, same token, same values. One registration moves
+     "last seen", a second identical one changes nothing. Returns whether it
+     was queued.
+     */
+    @discardableResult
+    func enqueuePushRegistration(_ event: EventPayload, registration: JSONObject) -> Bool {
+        let signature = PushRegistrationSignature(
+            uuid: event.uuid, distinctId: event.distinctId, registration: registration
+        )
+        if let last = lastPushRegistration, last.distinctId == signature.distinctId,
+           last.registration == signature.registration { return false }
+        lastPushRegistration = signature
+        enqueue(event)
+        return true
+    }
+
+    /// A removal leaves the list when ingest answers anything but "retry".
+    private func settlePushRemovals(_ uuids: Set<String>) {
+        guard var device = value.push, let pending = device.pendingRemovals,
+              pending.contains(where: { uuids.contains($0.uuid) }) else { return }
+        device.pendingRemovals = pending.filter { !uuids.contains($0.uuid) }
+        setPushDevice(device)
     }
 
     func reset() -> PurchaseIdentityTransition {
         let optedOut = value.optedOut
         let enabled = value.purchaseAttributionEnabled ?? false
+        let removals = value.queue.filter(Self.isPushDeviceRemoval)
+        lastPushRegistration = nil
+        // The token stays on the device so the next identify can register it.
+        // The switch does not: it belonged to the person who signs out.
+        var push = value.push
+        push?.enabled = nil
+        if push?.isEmpty == true { push = nil }
         let now = clock.now()
         let id = uuid.uuid()
         value = PersistedState(
@@ -1809,9 +2390,10 @@ private actor EventsState {
             pendingSet: [:],
             pendingSetOnce: [:],
             optedOut: optedOut,
-            queue: [],
+            queue: removals,
             account: nil,
-            deliveryAttempts: nil
+            deliveryAttempts: nil,
+            push: push
         )
         persist()
         return .init(token: id, enabled: enabled)
@@ -1842,7 +2424,10 @@ private actor EventsState {
     private func eventForQueue(_ event: EventPayload) -> EventPayload? {
         guard let beforeSend,
               event.event != "$mobile_purchase_prepared",
-              event.event != "$mobile_purchase_claim" else { return event }
+              event.event != "$mobile_purchase_claim",
+              event.event != FounderHQProtocolConstants.pushDeviceRegisteredEvent,
+              event.event != FounderHQProtocolConstants.pushDeviceRemovedEvent
+        else { return event }
         do {
             guard let result = try beforeSend(event) else { return nil }
             let name = result.event.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1956,6 +2541,7 @@ private actor EventsState {
         return restored.isEmpty ? nil : restored
     }
     func remove(uuids: Set<String>) {
+        settlePushRemovals(uuids)
         value.queue.removeAll { uuids.contains($0.uuid) }
         pruneDeliverySchedule()
         persist()
@@ -2003,6 +2589,9 @@ private actor EventsState {
         if !dropped.isEmpty {
             let exhausted = Set(dropped)
             value.queue.removeAll { exhausted.contains($0.uuid) }
+            if let last = lastPushRegistration, exhausted.contains(last.uuid) {
+                lastPushRegistration = nil
+            }
         }
         persist()
         return dropped
@@ -2065,6 +2654,9 @@ private actor EventsState {
 
     private func pruneQueue() {
         let before = value.queue.count
+        let registrationWaits = lastPushRegistration.map { last in
+            value.queue.contains { $0.uuid == last.uuid }
+        } ?? false
         value.queue = pruneEventQueue(
             value.queue,
             now: clock.now(),
@@ -2074,6 +2666,11 @@ private actor EventsState {
         if value.queue.count < before {
             founderHQDebugLog(debug) {
                 "dropped \(before - value.queue.count) event(s) over the queue size or age cap"
+            }
+            // A registration cut from the queue never reached the server.
+            if registrationWaits, let last = lastPushRegistration,
+               !value.queue.contains(where: { $0.uuid == last.uuid }) {
+                lastPushRegistration = nil
             }
         }
         pruneDeliverySchedule()
@@ -2362,6 +2959,44 @@ private struct PersistedState: Codable {
      optional so a state file written before this field still decodes.
      */
     var deliverySchedule: [String: DeliverySchedule]?
+    /// Absent until the app registers a push token or sets its push switch.
+    var push: FounderHQPushDeviceState?
+}
+
+extension PersistedState {
+    /**
+     The same as the synthesized decoder, except for `push`: a push state this
+     build cannot read is dropped alone. The identity and the queue must not
+     go with it.
+     */
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        anonymousId = try values.decode(String.self, forKey: .anonymousId)
+        distinctId = try values.decode(String.self, forKey: .distinctId)
+        identified = try values.decode(Bool.self, forKey: .identified)
+        purchaseAttributionToken = try values.decodeIfPresent(
+            String.self, forKey: .purchaseAttributionToken
+        )
+        purchaseAttributionEnabled = try values.decodeIfPresent(
+            Bool.self, forKey: .purchaseAttributionEnabled
+        )
+        sessionId = try values.decode(String.self, forKey: .sessionId)
+        sessionStartedAt = try values.decode(Date.self, forKey: .sessionStartedAt)
+        lastActivityAt = try values.decode(Date.self, forKey: .lastActivityAt)
+        registered = try values.decode(JSONObject.self, forKey: .registered)
+        pendingSet = try values.decode(JSONObject.self, forKey: .pendingSet)
+        pendingSetOnce = try values.decode(JSONObject.self, forKey: .pendingSetOnce)
+        optedOut = try values.decode(Bool.self, forKey: .optedOut)
+        queue = try values.decode([EventPayload].self, forKey: .queue)
+        account = try values.decodeIfPresent(AccountState.self, forKey: .account)
+        deliveryAttempts = try values.decodeIfPresent([String: Int].self, forKey: .deliveryAttempts)
+        deliverySchedule = try values.decodeIfPresent(
+            [String: DeliverySchedule].self, forKey: .deliverySchedule
+        )
+        let stored = (try? values.decodeIfPresent(FounderHQPushDeviceState.self, forKey: .push))
+            ?? nil
+        push = stored?.isEmpty == true ? nil : stored
+    }
 }
 
 /** One queued event's place on the retry ladder. */
@@ -2385,6 +3020,12 @@ private struct AccountState: Codable, Sendable {
     var properties: JSONObject
     let contextToken: String?
     let spanId: String
+}
+/// What makes two registrations the same. `uuid` names the queued event.
+private struct PushRegistrationSignature {
+    let uuid: String
+    let distinctId: String
+    let registration: JSONObject
 }
 private struct CaptureIdentity {
     let anonymousId: String
@@ -2714,6 +3355,12 @@ private func normalizeDistinctId(_ value: String) -> String? {
  */
 let founderHQRetryLadder: [TimeInterval?] = [30, 30, 120, 300, nil]
 
+/**
+ Cuts the queue to its age and size limits. A device removal is an instruction
+ and not analytics: it has no age limit (it keeps the time of the sign-out, and
+ the list of pending removals holds at most 10), and when the queue is over its
+ size, the other events are cut first, oldest first.
+ */
 private func pruneEventQueue(
     _ queue: [EventPayload],
     now: Date,
@@ -2721,12 +3368,26 @@ private func pruneEventQueue(
     eventTTL: TimeInterval
 ) -> [EventPayload] {
     let cutoff = now.addingTimeInterval(-max(0, eventTTL))
-    return Array(queue.filter {
+    func isRemoval(_ event: EventPayload) -> Bool {
+        event.event == FounderHQProtocolConstants.pushDeviceRemovedEvent
+    }
+    var kept = queue.filter {
+        if isRemoval($0) { return true }
         guard let createdAt = parseEventTimestamp($0.timestamp) else {
             return false
         }
         return createdAt >= cutoff
-    }.suffix(max(1, maxQueueSize)))
+    }
+    let limit = max(1, maxQueueSize)
+    var excess = kept.count - limit
+    guard excess > 0 else { return kept }
+    kept = kept.filter { event in
+        guard excess > 0, !isRemoval(event) else { return true }
+        excess -= 1
+        return false
+    }
+    // Only removals are left over the limit: the newest stay.
+    return Array(kept.suffix(limit))
 }
 
 private extension String {

@@ -6,18 +6,18 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 
 `https://github.com/FounderHQ/founderhq-events-ios`
 
-Select version **1.1.1** or later. Swift Package Manager is the recommended installation method.
+Select version **1.2.0** or later. Swift Package Manager is the recommended installation method.
 
 For CocoaPods:
 
 ```ruby
-pod 'FounderHQEvents', '~> 1.1.1'
+pod 'FounderHQEvents', '~> 1.2.0'
 ```
 
 For installation directly from the release tag:
 
 ```ruby
-pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.1.1'
+pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.2.0'
 ```
 
 Both installation methods use the same Swift implementation. Requires iOS 15 or later.
@@ -29,7 +29,7 @@ application lifecycle and UIKit screen capture, a SwiftUI `founderHQScreen`
 modifier, durable identity/queue/consent, and the same capture/profile API as
 the web SDK. Advertising identifiers are never collected.
 
-Version 1.1.1 sends protocol v2 requests to `POST /i/v2/e`, emits
+Version 1.2.0 sends protocol v2 requests to `POST /i/v2/e`, emits
 `$session_start`, uses UUIDv7 sessions and screen-scoped `$screen_id` values,
 and reports screen/viewport dimensions in physical pixels. Automatic facts use
 the canonical `$` taxonomy and deep links recognize all 24 campaign keys.
@@ -75,7 +75,8 @@ the SDK captures for you.
 | `tracingHeaders` | `nil` | Exact hostnames whose requests carry `x-founderhq-session-id`. |
 | `capturePushNotificationOpened` | `true` | Emits `$push_notification_opened` when the user taps a notification. |
 | `autoProperties` | `nil` | Adds properties to screens, taps, and rage taps on the main actor. |
-| `beforeSend` | `nil` | Changes or drops finished events before queueing, except purchase controls. |
+| `onPushNotificationOpened` | `nil` | Gives your app the message ID and link of an opened notification, on the main actor. |
+| `beforeSend` | `nil` | Changes or drops finished events before queueing, except purchase and push device controls. |
 | `debug` | `false` | Logs what the SDK drops, refuses, or fails to install. |
 
 ### The retry ladder
@@ -275,7 +276,7 @@ or drop events.
 ## beforeSend
 
 Use `beforeSend` to change or drop a finished event before it enters the
-queue. Purchase control events bypass it:
+queue. Purchase and push device control events bypass it:
 
 ```swift
 let configuration = FounderHQEventsConfiguration(beforeSend: { event in
@@ -326,6 +327,77 @@ state; it is not a main-actor callback. `autoProperties` and the UIKit
 declarative-property walk run on the main actor. Changing or dropping automatic
 events can affect sessions, identity, and screen reports.
 
+## Push notifications
+
+Available from version 1.2.0.
+
+Register the device so FounderHQ Sequences can send it a push. The SDK never
+asks for the notification permission and never gets a token itself.
+
+Create the SDK in `application(_:didFinishLaunchingWithOptions:)`. iOS reports
+the tap that started the app right after that method returns, so an SDK that
+is created later does not see it.
+
+An app uses one push service. With APNs, pass the `Data` token. With Firebase,
+pass the FCM token with `.fcm()` and never the APNs token: Firebase refuses it.
+
+```swift
+func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+) {
+    events.registerPushToken(deviceToken) // APNs
+}
+
+events.registerPushToken(fcmToken, options: .fcm()) // Firebase
+events.setPushEnabled(false)   // your app's own switch for this device
+events.unregisterPushToken()   // remove the device and forget the token
+```
+
+The SDK always stores the token. A device is registered only for an
+identified person: the SDK sends the registration after `identify` and until
+`reset()`, and sends nothing for a guest. While a person is identified, the
+SDK sends the registration again on every app start, on a new token, and
+after `setPushEnabled`. It sends one registration in a start: a
+`registerPushToken` call that changes nothing sends no second one.
+
+`reset()` removes the device from the person who signs out. It keeps the
+token on the phone and clears the `setPushEnabled` switch. An `identify` for
+another person clears the switch too. If the phone is offline, the SDK keeps
+the removal and sends it first on the next app start, with the time of the
+sign-out. If the same person signs in again before the removal is sent, the
+SDK drops it.
+While the person is opted out, registrations wait, but a removal is still
+sent. The two device events (`$push_device_registered` and
+`$push_device_removed`) bypass `beforeSend`.
+
+The SDK does not store or send a token that FounderHQ refuses. It logs the
+reason with `NSLog`, and never the token.
+
+For an APNs token the SDK reads the environment from the build: `sandbox`
+for a simulator or a development provisioning profile, `production` for an
+ad hoc, TestFlight, or App Store build. It reads the embedded provisioning
+profile, so it cannot tell for a Mac build without one; it then sends no
+environment and the server tries production, then sandbox. Pass
+`options: .apns(environment:)` to set it yourself. The options
+(`FounderHQPushRegistrationOptions`) hold `provider`, `appId`, `environment`,
+`enabled`, and `permission`, in that order on every platform. The permission state comes from
+`UNUserNotificationCenter.getNotificationSettings`, which shows no prompt.
+
+When a person opens a notification, `$push_notification_opened` carries
+`$push_message_id`. The SDK reads two keys of `userInfo`,
+`fhqOutboundMessageId` and `fhqLink`, and nothing else. It never opens the
+link. Set `onPushNotificationOpened` in the configuration to get it, or read
+it with `FounderHQPushPayload(userInfo:)`. The handler runs on the main
+actor, so it can open the link directly. A notification that Expo delivered
+keeps the two keys under `body`, and the SDK reads them there.
+
+With `capturePushNotificationOpened: false`, report the open yourself with
+`capturePushNotificationOpened(userInfo:)`, which returns the link. It sends
+nothing and returns `nil` for a payload with no FounderHQ key, so you can
+pass every notification. While `capturePushNotificationOpened` is `true`, the
+SDK reports the open, and this method only returns the link.
+
 ## Privacy manifest
 
 The package includes the required-reason declaration for its app-local
@@ -350,6 +422,19 @@ installs it on the simulator, taps a real control, and prints one line per
 check.
 
 ## Release notes
+
+### 1.2.0
+
+- Push notifications for FounderHQ Sequences: `registerPushToken`,
+  `setPushEnabled`, `unregisterPushToken`, and
+  `FounderHQPushRegistrationOptions` (`.apns()`, `.fcm()`, `.expo()`).
+  `reset()` removes the device from the person who signs out.
+- `$push_notification_opened` carries `$push_message_id`. New:
+  `onPushNotificationOpened`, `FounderHQPushPayload`, and
+  `capturePushNotificationOpened(userInfo:properties:)`.
+- The SDK hooks the notification centre when it is created, not after remote
+  config loads, so it also reports the tap that started the app.
+- The pod version and the SDK version sent on the wire are both `1.2.0`.
 
 ### 1.1.1
 

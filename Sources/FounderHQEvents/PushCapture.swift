@@ -14,9 +14,11 @@ import ObjectiveC.runtime
  handler, exactly as the system expects.
 
  What it stores: the action identifier, the category identifier, the request
- identifier, and whether the notification came from a push or a local trigger.
- What it refuses to store: the title, subtitle, body, badge, sound, the
- `userInfo` payload, and any text the user typed into a reply action.
+ identifier, whether the notification came from a push or a local trigger, and
+ the FounderHQ message id (`fhqOutboundMessageId` in `userInfo`). It also
+ reads `fhqLink` from `userInfo` and hands it to the app; the link is not sent.
+ What it refuses to store: the title, subtitle, body, badge, sound, every
+ other `userInfo` key, and any text the user typed into a reply action.
  */
 enum FounderHQPushCapture {
     private static weak var client: FounderHQEvents?
@@ -114,7 +116,10 @@ enum FounderHQPushCapture {
         if !category.isEmpty {
             properties["$push_category_identifier"] = category
         }
-        client.capture("$push_notification_opened", properties: properties)
+        client.pushNotificationOpened(
+            FounderHQPushPayload(userInfo: request.content.userInfo),
+            properties: properties
+        )
     }
 }
 
