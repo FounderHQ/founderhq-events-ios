@@ -137,4 +137,10 @@ public enum FounderHQProtocolConstants {
 
     /// The key of a push payload that holds the image URL.
     public static let pushPayloadImageUrlKey = "fhqImageUrl"
+
+    /// The key of a push payload that holds the notification key.
+    public static let pushPayloadNotificationKey = "fhqNotificationKey"
+
+    /// The key of a silent push that names the notification to remove.
+    public static let pushPayloadRemoveNotificationKey = "fhqRemoveNotificationKey"
 }

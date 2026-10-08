@@ -1114,3 +1114,23 @@ private final class PushTransport: FounderHQTransport, @unchecked Sendable {
         )
     }
 }
+
+// The harness is private to this file, so the removal tests that need a
+// client live here; the pure ones are in PushNotificationRemovalTests.swift.
+extension PushDeviceTests {
+    func testEveryOtherPushIsLeftToTheApp() {
+        let client = PushHarness().client()
+        XCTAssertFalse(client.handleRemoteNotification(userInfo: ["aps": ["content-available": 1]]))
+    }
+
+    func testARemovalInAProcessThatIsNotAnAppStillAnswers() {
+        let client = PushHarness().client()
+        let answered = expectation(description: "completion")
+        XCTAssertTrue(client.handleRemoteNotification(
+            userInfo: ["fhqRemoveNotificationKey": "order-42"],
+            completion: { answered.fulfill() }
+        ))
+        wait(for: [answered], timeout: 2)
+    }
+}
+

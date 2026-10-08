@@ -6,18 +6,18 @@ In Xcode, choose **File → Add Package Dependencies** and enter:
 
 `https://github.com/FounderHQ/founderhq-events-ios`
 
-Select version **1.2.0** or later. Swift Package Manager is the recommended installation method.
+Select version **1.3.0** or later. Swift Package Manager is the recommended installation method.
 
 For CocoaPods:
 
 ```ruby
-pod 'FounderHQEvents', '~> 1.2.0'
+pod 'FounderHQEvents', '~> 1.3.0'
 ```
 
 For installation directly from the release tag:
 
 ```ruby
-pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.2.0'
+pod 'FounderHQEvents', :git => 'https://github.com/FounderHQ/founderhq-events-ios.git', :tag => 'v1.3.0'
 ```
 
 Both installation methods use the same Swift implementation. Requires iOS 15 or later.
@@ -398,6 +398,40 @@ nothing and returns `nil` for a payload with no FounderHQ key, so you can
 pass every notification. While `capturePushNotificationOpened` is `true`, the
 SDK reports the open, and this method only returns the link.
 
+### Replace or remove a notification
+
+A FounderHQ push has a notification key: the key the sender set, or else the
+message id. A later push with the same key replaces the notification.
+
+Remove a notification when the person has seen what it is about:
+
+```swift
+events.dismissPushNotification(key: "order-1042")
+```
+
+FounderHQ can also ask from the server (`POST /api/v1/push/remove`). It sends
+a silent push; hand every remote notification to the SDK. Turn on the
+**Remote notifications** background mode first.
+
+```swift
+func application(
+    _ application: UIApplication,
+    didReceiveRemoteNotification userInfo: [AnyHashable: Any],
+    fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
+) {
+    if events.handleRemoteNotification(userInfo: userInfo, completion: {
+        completionHandler(.noData)
+    }) { return }
+    // Your own handling.
+    completionHandler(.noData)
+}
+```
+
+`handleRemoteNotification` returns `true` for a FounderHQ removal and calls
+`completion` when the notification is gone. It returns `false` for every
+other push and does not call `completion`. Apple delivers a silent push when
+it chooses to, and not to an app the person closed from the app switcher.
+
 ## Privacy manifest
 
 The package includes the required-reason declaration for its app-local
@@ -422,6 +456,15 @@ installs it on the simulator, taps a real control, and prints one line per
 check.
 
 ## Release notes
+
+### 1.3.0
+
+- New: `dismissPushNotification(key:completion:)` removes the delivered
+  notifications with that notification key (or message ID). Call it when the
+  person has seen what the notification is about.
+- New: `handleRemoteNotification(userInfo:completion:)` removes a
+  notification when FounderHQ asks from your server with a silent push.
+- The pod version and the SDK version sent on the wire are both `1.3.0`.
 
 ### 1.2.0
 
