@@ -304,7 +304,7 @@ public struct FounderHQEventsConfiguration: Sendable {
 
 public final class FounderHQEvents: @unchecked Sendable {
     public static let sdkName = "FounderHQEvents"
-    public static let sdkVersion = "1.2.0"
+    public static let sdkVersion = "1.3.0"
 
     private let apiKey: String
     private let configuration: FounderHQEventsConfiguration
