@@ -1,7 +1,7 @@
 {
   "repository": "FounderHQ/founderhq-events-ios",
   "version": "1.3.0",
-  "sourceCommit": "b23122db7ce31d90e5753dd1a1bcdf0e215b87d3",
+  "sourceCommit": "080c40a1a436e5e5fbeaea078f099a23a822e634",
   "files": {
     ".github/workflows/release.yml": "f8f80a55ba9c8f69785cc99382881962b5288cba8bf629ef141e4a5e6d6d9404",
     ".gitignore": "14381eea8ee07ee2479db564fb75f9814f9a510041eb1eac35da5bd01adfc3c8",
